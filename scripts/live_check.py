@@ -108,8 +108,9 @@ def main() -> int:
             print('waiting for bridge + first sync…')
             if not wait(healthy, timeout=60):
                 print('BRIDGE DID NOT BECOME HEALTHY — log tail:')
-                print('\n'.join(open(log_path, errors='replace')
-                                .read().splitlines()[-40:]))
+                with open(log_path, errors='replace') as log_fh:
+                    tail = log_fh.read().splitlines()[-40:]
+                print('\n'.join(tail))
                 return 1
             with urllib.request.urlopen(
                     f'http://127.0.0.1:{health_port}/status') as resp:

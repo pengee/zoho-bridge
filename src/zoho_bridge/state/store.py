@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 __all__ = ['Store', 'FolderRow', 'MessageRow', 'OpRow']
 
@@ -48,7 +48,7 @@ class MessageRow:
     has_raw: bool = False
     pending_op: str | None = None
 
-    def with_flags(self, flags: frozenset[str]) -> 'MessageRow':
+    def with_flags(self, flags: frozenset[str]) -> MessageRow:
         return replace(self, flags=frozenset(flags))
 
 

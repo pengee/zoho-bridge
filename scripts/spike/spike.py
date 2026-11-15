@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 DC_ACCOUNTS = {
     "com": "https://accounts.zoho.com",
@@ -365,7 +365,7 @@ class Spike:
         if not self.address:
             p.inconclusive("no account address known")
             return p
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         subject = f"[zoho-bridge spike] plain send {stamp}"
         payload = {"fromAddress": self.address,
                    "toAddress": self.address,
@@ -438,7 +438,7 @@ class Spike:
         if not self.address:
             p.inconclusive("no account address known")
             return p
-        stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+        stamp = datetime.now(UTC).strftime("%H%M%S")
         base = {"fromAddress": self.address,
                 "toAddress": self.address,
                 "subject": f"[zoho-bridge spike] draft {stamp}",
@@ -537,7 +537,7 @@ class Spike:
 
     def write_notes(self) -> None:
         run_lines = [
-            f"\n## Spike run {datetime.now(timezone.utc).isoformat()} "
+            f"\n## Spike run {datetime.now(UTC).isoformat()} "
             f"(dc={self.dc})\n",
         ]
         for probe in self.probes:

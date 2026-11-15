@@ -103,19 +103,26 @@ last sync, folders, pending/dead ops, raw-cache size).
 | `BRIDGE_DB_PATH` | `bridge.db` | SQLite state (persistent volume!) |
 | `BRIDGE_POLL_SECONDS` | `120` | Zoho → bridge sync interval |
 | `BRIDGE_PREFETCH` | `25` | newest messages whose bodies are pre-fetched per sync |
+| `BRIDGE_FULL_SCAN_EVERY` | `10` | full folder sweep (deletions + stale flags) every N cycles; other cycles page only for new arrivals |
 | `BRIDGE_RAW_CACHE_MB` | `512` | raw-message cache budget |
 | `BRIDGE_SMTP_PORT` / `BRIDGE_SMTP_HOST` | `10587` / `0.0.0.0` | submission listener |
-| `BRIDGE_HEALTH_PORT` | `8000` | health/status HTTP |
+| `BRIDGE_HEALTH_PORT` / `BRIDGE_HEALTH_HOST` | `8000` / `127.0.0.1` | health/status HTTP (unauthenticated — keep loopback) |
 | `BRIDGE_ALLOW_ATTACHMENT_LOSS` | `0` | send without attachments if upload endpoint fails (otherwise submission is rejected) |
 | `CERT_FILE` / `KEY_FILE` | auto self-signed | TLS cert for STARTTLS |
+| `BRIDGE_TLS_HOSTNAME` | host name | comma-separated SAN entries for the self-signed cert |
 
 ## Development
 
 ```bash
-uv sync                                  # deps + editable install
-uv run pytest tests/test_store.py -q     # unit tests
+uv sync                                  # deps + editable install (uses uv.lock)
+uv run ruff check .                       # lint
+uv run pytest tests/ -q --ignore=tests/test_imap_e2e.py  # unit tests
 uv run pytest tests/test_imap_e2e.py -q  # full E2E (bridge subprocess + fake Zoho, no account needed)
 ```
+
+GitHub Actions runs ruff + both test tiers on Linux and Windows on every push
+and PR (`.github/workflows/ci.yml`). `uv.lock` is committed for reproducible
+dev/CI installs.
 
 The E2E runs the **real pymap server as a subprocess** (`tests/bridge_boot.py`,
 which also shims out pymap's Unix-only signal handlers on Windows) against an
@@ -134,7 +141,9 @@ uv run python scripts/live_check.py
 - **`proxyprotocol` drops the connection-task reference**
   (`reader.py:_read_then_call` → `create_task` result discarded): tasks were
   reaped by the cyclic GC seconds in, killing live IMAP connections silently.
-  Patched in `zoho_bridge/main.py` with a reference-keeping variant.
+  Patched in `zoho_bridge/main.py` with a reference-keeping variant. The
+  `proxy-protocol` package is a pinned direct dependency precisely because of
+  this patch — re-verify `_read_then_call`'s signature on any bump.
 - **`pymap.concurrent._AsyncioEvent.wait(timeout=…)` leaks one orphaned inner
   task per call** (observed on CPython 3.14) — the bridge avoids it by using
   a plain `asyncio.Event` for the sync wake.
@@ -147,6 +156,8 @@ uv run python scripts/live_check.py
 ```
 src/zoho_bridge/
   config.py            env settings + pymap BridgeConfig
+  context.py           BridgeContext: shared services handle
+  mimeutil.py          shared MIME parsing (drafts + submission)
   zoho/client.py       REST client (OAuth refresh, retry, variant probes)
   zoho/models.py       response normalization
   state/store.py       SQLite: folders/UID map/flags/raw cache/outbox ops
@@ -158,3 +169,24 @@ src/zoho_bridge/
 scripts/spike/spike.py phase 0 endpoint probe (stdlib-only)
 docs/                  OAuth setup + verified-API notes
 ```
+
+## Security & sync notes
+
+- **Auth is TLS-gated.** pymap advertises `LOGINDISABLED` until STARTTLS, so
+  credentials never cross the wire in cleartext to a non-loopback client. As a
+  deliberate pymap behavior, **connections from `127.0.0.1`/`localhost` may
+  authenticate without STARTTLS** (loopback is treated as trusted) — so don't
+  run untrusted processes on the same host as the bridge, or don't expose
+  1143/10587 on a shared machine.
+- **health/status is unauthenticated** and now binds `127.0.0.1` by default
+  (`BRIDGE_HEALTH_HOST`). The container sets it to `0.0.0.0` internally only so
+  a host-side `127.0.0.1:8000:8000` publish can reach it; keep that publish
+  host-local.
+- **Self-signed cert** (new installs) carries a `subjectAltName` of
+  `BRIDGE_TLS_HOSTNAME` (default: the host name) and `CA=FALSE`, so you *can*
+  distribute the cert and keep TLS verification on instead of disabling it.
+- **Sync cadence.** Each poll cycle normally pages a folder only until the
+  first page of already-known messages (fast for idle folders). A full sweep
+  every `BRIDGE_FULL_SCAN_EVERY` cycles re-reads everything to catch older
+  flag changes and deletions made in webmail. Deletions propagate within that
+  sweep window, not the per-cycle window.

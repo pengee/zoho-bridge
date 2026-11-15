@@ -10,6 +10,10 @@ dependencies = [
     "aiosmtpd>=1.4.6,<2",
     "httpx>=0.28,<1",
     "cryptography>=43,<46",
+    # direct dep because main.py monkey-patches its private
+    # ProxyProtocolReader._read_then_call (connection-task retention fix):
+    # re-verify that patch whenever this range moves
+    "proxy-protocol>=0.11.3,<0.12",
 ]
 
 [project.entry-points."pymap.backend"]
@@ -20,6 +24,7 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "aiohttp>=3.10",
+    "ruff>=0.6",
 ]
 
 [build-system]
@@ -31,4 +36,26 @@ packages = ["src/zoho_bridge"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 79
+extend-exclude = [".venv", ".vs"]
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",   # pycodestyle (errors, sane subset)
+    "F",                # pyflakes
+    "W",                # pycodestyle warnings
+    "I",                # isort
+    "UP",               # pyupgrade
+    "B",                # bugbear
+    "SIM",              # simplify
+    "BLE",              # blind-except policy (repo marks deliberate ones)
+    "SLF001",           # private-member access (explicitly allowed in tests)
+    "RUF100",           # unused noqa (keeps the marker comments honest)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["SLF001"]  # tests intentionally introspect store internals

@@ -11,50 +11,49 @@ Structure mirrors ``pymap.backend.dict`` — the reference backend plugin.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from argparse import ArgumentParser, Namespace
 from collections.abc import AsyncIterable, Iterable
-from contextlib import asynccontextmanager, AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Final, TypeVar
 from weakref import WeakValueDictionary
 
-from pysasl.creds.server import ServerCredentials
-from pysasl.identity import ClearIdentity
-
 from pymap.backend.mailbox import MailboxDataInterface, MailboxSetInterface
 from pymap.backend.session import BaseSession
-from pymap.config import BackendCapability, IMAPConfig
 from pymap.concurrent import Event, ReadWriteLock
 from pymap.context import subsystem
-from pymap.exceptions import AuthorizationFailure, InvalidAuth, \
-    NotAllowedError, UserNotFound
+from pymap.exceptions import (
+    AuthorizationFailure,
+    InvalidAuth,
+    NotAllowedError,
+    UserNotFound,
+)
 from pymap.flags import FlagOp
 from pymap.health import HealthStatus
 from pymap.interfaces.backend import BackendInterface
-from pymap.interfaces.login import LoginInterface, IdentityInterface
+from pymap.interfaces.login import IdentityInterface, LoginInterface
 from pymap.listtree import ListTree
 from pymap.mailbox import MailboxSnapshot
-from pymap.message import BaseMessage, BaseLoadedMessage
+from pymap.message import BaseLoadedMessage, BaseMessage
 from pymap.mime import MessageContent
 from pymap.parsing.message import AppendMessage
-from pymap.parsing.specials import ObjectId, FetchRequirement
-from pymap.parsing.specials.flag import get_system_flags, Flag, Seen, Flagged
-from pymap.selected import SelectedSet, SelectedMailbox
+from pymap.parsing.specials import FetchRequirement, ObjectId
+from pymap.parsing.specials.flag import Flag, Flagged, Seen
+from pymap.selected import SelectedMailbox, SelectedSet
 from pymap.token import AllTokens
 from pymap.user import UserMetadata
+from pysasl.creds.server import ServerCredentials
+from pysasl.identity import ClearIdentity
 
 from ..config import BridgeConfig, BridgeSettings
 from ..context import BridgeContext
 from ..poller import OpsWorker, Poller
 from ..smtp.handler import SubmissionServer
-from ..state.store import FolderRow, MessageRow, Store, \
-    normalize_message_id
+from ..state.store import FolderRow, MessageRow, Store, normalize_message_id
 from ..zoho.client import ZohoClient
-from ..zoho.models import Folder
 from .health import HealthServer
 
 __all__ = ['ZohoBackend']
@@ -110,7 +109,7 @@ class Message(BaseMessage):
                  thread_id: ObjectId | None = None,
                  recent: bool = False,
                  zoho_id: str | None = None,
-                 loader: 'ZohoMailboxData | None' = None) -> None:
+                 loader: ZohoMailboxData | None = None) -> None:
         super().__init__(uid, internal_date, permanent_flags,
                          expunged=expunged,
                          email_id=email_id or
@@ -122,8 +121,8 @@ class Message(BaseMessage):
         self.zoho_id = zoho_id
 
     @classmethod
-    def copy(cls, msg: 'Message', *, uid: int | None = None,
-             recent: bool = False, expunged: bool = False) -> 'Message':
+    def copy(cls, msg: Message, *, uid: int | None = None,
+             recent: bool = False, expunged: bool = False) -> Message:
         return cls(uid if uid is not None else msg.uid,
                    msg.internal_date, msg.permanent_flags,
                    expunged=expunged, email_id=msg.email_id,
@@ -204,7 +203,7 @@ class _ModSeqTracker:
 class ZohoMailboxData(MailboxDataInterface[Message]):
     """One IMAP mailbox backed by a Zoho folder (mirrored in the store)."""
 
-    def __init__(self, context: 'BridgeContext', folder: FolderRow) -> None:
+    def __init__(self, context: BridgeContext, folder: FolderRow) -> None:
         self._context = context
         self._folder = folder
         self._mailbox_id = ObjectId(folder.mailbox_id.encode('ascii'))
@@ -289,7 +288,7 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
         if self._housekeeping_counter % 25 == 0:
             try:
                 self._context.store.prune_raw_cache(budget)
-            except Exception:  # noqa: BLE001 - pruning is best-effort
+            except Exception:
                 log.exception('raw cache prune failed')
         self._housekeeping_counter += 1
 
@@ -426,7 +425,7 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
                              uid=uid, payload={'message_id': message_id})
             store.set_pending_op(self._folder.zoho_id, uid, 'file_sent')
 
-    async def copy(self, uid: int, destination: 'ZohoMailboxData', *,
+    async def copy(self, uid: int, destination: ZohoMailboxData, *,
                    recent: bool = False) -> int | None:
         src = self._messages.get(uid)
         if src is None:
@@ -436,7 +435,7 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
                                             src.permanent_flags,
                                             recent=recent)
 
-    async def move(self, uid: int, destination: 'ZohoMailboxData', *,
+    async def move(self, uid: int, destination: ZohoMailboxData, *,
                    recent: bool = False) -> int | None:
         src = self._messages.get(uid)
         if src is None:
@@ -552,7 +551,6 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
                            flag_updates: list[MessageRow],
                            removed_uids: list[int]) -> None:
         """Apply changes discovered by the poller (Zoho → bridge)."""
-        store = self._context.store
         async with self._messages_lock.write_lock():
             for row in added:
                 if row.uid not in self._messages:
@@ -578,7 +576,7 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
 class ZohoMailboxSet(MailboxSetInterface[ZohoMailboxData]):
     """The set of mailboxes for the bridge's Zoho account."""
 
-    def __init__(self, context: 'BridgeContext') -> None:
+    def __init__(self, context: BridgeContext) -> None:
         super().__init__()
         self._context = context
         self._data: dict[str, ZohoMailboxData] = {}
@@ -613,12 +611,12 @@ class ZohoMailboxSet(MailboxSetInterface[ZohoMailboxData]):
     async def set_subscribed(self, name: str, subscribed: bool) -> None:
         self._subscribed[self._normalize(name)] = subscribed
 
-    async def list_subscribed(self) -> 'ListTree':
+    async def list_subscribed(self) -> ListTree:
         names = [name for name, subscribed in self._subscribed.items()
                  if subscribed and name in self._data]
         return ListTree(self.delimiter).update('INBOX', *names)
 
-    async def list_mailboxes(self) -> 'ListTree':
+    async def list_mailboxes(self) -> ListTree:
         return ListTree(self.delimiter).update(*self._data.keys())
 
     async def get_mailbox(self, name: str) -> ZohoMailboxData:
@@ -682,7 +680,7 @@ class ZohoLogin(LoginInterface):
     """Static-credential login; all users see the one bridged Zoho account."""
 
     def __init__(self, config: BridgeConfig,
-                 mailbox_set: 'ZohoMailboxSet | None' = None) -> None:
+                 mailbox_set: ZohoMailboxSet | None = None) -> None:
         super().__init__()
         self.config: Final = config
         self.mailbox_set = mailbox_set
@@ -780,7 +778,7 @@ class ZohoBackend(BackendInterface):
 
     @classmethod
     async def init(cls, args: Namespace, **overrides: Any) \
-            -> tuple['ZohoBackend', BridgeConfig]:
+            -> tuple[ZohoBackend, BridgeConfig]:
         settings = BridgeSettings.from_env()
         settings.validate()
         cert_file, key_file = cls._ensure_certificates(args, settings)
@@ -825,12 +823,12 @@ class ZohoBackend(BackendInterface):
     def _generate_self_signed(cls, cert_path: str, key_path: str,
                               settings: BridgeSettings) -> None:
         import socket
+        from datetime import timedelta
 
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
-        from datetime import timedelta
 
         hostnames = [n.strip() for n in
                      settings.tls_hostnames.split(',') if n.strip()]
@@ -903,8 +901,6 @@ class ZohoBackend(BackendInterface):
         context = self.context
         if context is None:
             return
-        try:
+        with suppress(Exception):  # shutdown must not fail
             await context.client.aclose()
-        except Exception:  # noqa: BLE001 - shutdown must not fail
-            pass
         context.store.close()

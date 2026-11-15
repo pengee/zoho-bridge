@@ -1,7 +1,84 @@
 """Unit tests for the SQLite store and Zoho response normalization."""
 
+import sqlite3
+
 from zoho_bridge.state.store import MessageRow, Store, normalize_message_id
 from zoho_bridge.zoho.models import MessageSummary
+
+# schema exactly as shipped before the `deleted` column was dropped —
+# a database created by that version must keep working untouched
+_LEGACY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS folders (
+    zoho_id TEXT PRIMARY KEY,
+    imap_name TEXT NOT NULL UNIQUE,
+    zoho_name TEXT NOT NULL,
+    mailbox_id TEXT NOT NULL,
+    uid_validity INTEGER NOT NULL,
+    uid_next INTEGER NOT NULL DEFAULT 1,
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages (
+    zoho_folder_id TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    zoho_id TEXT,
+    message_id TEXT,
+    flags TEXT NOT NULL DEFAULT '',
+    internal_date REAL NOT NULL DEFAULT 0,
+    size INTEGER,
+    subject TEXT,
+    sender TEXT,
+    raw BLOB,
+    raw_last_access REAL,
+    pending_op TEXT,
+    PRIMARY KEY (zoho_folder_id, uid)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_zoho_id ON messages(zoho_id);
+CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
+CREATE TABLE IF NOT EXISTS outbox_ops (
+    op_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    zoho_folder_id TEXT,
+    uid INTEGER,
+    payload TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created REAL NOT NULL,
+    next_try REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS idx_ops_due ON outbox_ops(status, next_try);
+"""
+
+
+def test_legacy_schema_database_still_opens(tmp_path) -> None:
+    """Databases created by the pre-cleanup version (extra `deleted`
+    column) must open, read, write and bootstrap the raw counter."""
+    path = tmp_path / 'legacy.db'
+    conn = sqlite3.connect(path)
+    conn.executescript(_LEGACY_SCHEMA)
+    conn.execute(
+        "INSERT INTO folders(zoho_id, imap_name, zoho_name, mailbox_id, "
+        "uid_validity, uid_next, deleted) "
+        "VALUES('F1', 'INBOX', 'Inbox', 'mb1', 1, 7, 0)")
+    conn.execute("INSERT INTO messages(zoho_folder_id, uid, zoho_id, raw) "
+                 "VALUES('F1', 1, 'M1', x'616263')")
+    conn.commit()
+    conn.close()
+
+    store = Store(str(path))
+    try:
+        assert store.get_folder_by_name('INBOX').zoho_id == 'F1'
+        assert store.alloc_uids('F1') == [7]
+        assert store.raw_cache_size() == 3  # counter bootstrapped
+        assert store.load_raw('F1', 1) == b'abc'
+        # inserts no longer name the legacy column — default covers it
+        store.upsert_folder(zoho_id='F2', imap_name='Sent')
+        assert store.get_folder_by_name('Sent').zoho_id == 'F2'
+    finally:
+        store.close()
 
 
 def test_normalize_message_id() -> None:

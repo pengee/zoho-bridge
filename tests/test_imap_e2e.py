@@ -10,6 +10,7 @@ SMTP submission with STARTTLS+AUTH, sent-copy dedupe, UID stability.
 
 from __future__ import annotations
 
+import contextlib
 import imaplib
 import json
 import os
@@ -23,7 +24,8 @@ import time
 import urllib.request
 import uuid
 
-from fake_zoho import (ACCESS_TOKEN, ACCOUNT_ID, FakeZoho, simple_message)
+from fake_zoho import ACCESS_TOKEN, ACCOUNT_ID, FakeZoho, simple_message
+
 from zoho_bridge.imap.backend import ZohoBackend  # noqa: F401 (sanity import)
 
 
@@ -259,10 +261,8 @@ def test_bridge_end_to_end(tmp_path, monkeypatch) -> None:
         # -- uid stability across reconnects ---------------------------------------------
         typ, res = imap.uid('SEARCH', None, 'ALL')
         uids_before = res[0]
-        try:
+        with contextlib.suppress(Exception):
             imap.logout()
-        except Exception:  # noqa: BLE001
-            pass
         imap = None
 
         def _reconnect() -> bytes:
@@ -288,10 +288,8 @@ def test_bridge_end_to_end(tmp_path, monkeypatch) -> None:
                 assert typ == 'OK', f'select INBOX: {data}'
                 return int(data[0])
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     client.logout()
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
 
         assert_wait(harness, lambda: _inbox_count() == 1,
                     'ghost-test message did not sync into INBOX')
@@ -335,10 +333,8 @@ def test_bridge_end_to_end(tmp_path, monkeypatch) -> None:
         step(f'finally: m1.read={m1.read} m2.folder={m2.folder_id} '
              f'events={fake.events[-6:]!r}')
         if imap is not None:
-            try:
+            with contextlib.suppress(Exception):
                 imap.logout()
-            except Exception:  # noqa: BLE001
-                pass
         harness.stop()
         fake.stop_in_thread()
 

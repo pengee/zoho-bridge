@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from .context import BridgeContext
@@ -40,13 +41,12 @@ class Poller:
                 await self.sync_all()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - never let the loop die
+            except Exception:
                 log.exception('sync failed')
-            try:
+            # wait for the next sync or the poll interval, whichever first
+            with suppress(TimeoutError):
                 await asyncio.wait_for(context.sync_wake.wait(),
                                        timeout=context.settings.poll_seconds)
-            except (TimeoutError, asyncio.TimeoutError):
-                pass
             context.sync_wake.clear()
 
     # -- top level ---------------------------------------------------------
@@ -176,11 +176,10 @@ class Poller:
                 else:
                     store.upsert_message(new_row)
                     added_rows.append(new_row)
-            elif row.uid not in pending_uids:
-                if desired_flags != row.flags:
-                    updated = row.with_flags(desired_flags)
-                    store.set_flags(zoho_id, row.uid, desired_flags)
-                    flag_rows.append(updated)
+            elif row.uid not in pending_uids and desired_flags != row.flags:
+                updated = row.with_flags(desired_flags)
+                store.set_flags(zoho_id, row.uid, desired_flags)
+                flag_rows.append(updated)
         # safety rule: deletion detection requires a complete listing —
         # an early-stopped incremental window (or a MAX_PAGES-truncated
         # sweep) must never be interpreted as mass deletion
@@ -263,11 +262,9 @@ class Poller:
                 context.store.store_raw(data.folder.zoho_id, row.uid, raw)
 
         await asyncio.gather(*(fetch(row) for row in newest))
-        try:
+        with suppress(Exception):  # pruning is best-effort
             context.store.prune_raw_cache(
                 context.settings.raw_cache_mb * 1024 * 1024)
-        except Exception:  # noqa: BLE001 - pruning is best-effort
-            pass
 
 
 class OpsWorker:

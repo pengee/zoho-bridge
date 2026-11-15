@@ -61,14 +61,14 @@ async def test_sent_copy_link_refreshes_in_memory_message() -> None:
     context = BridgeContext(BridgeSettings(prefetch=0),
                             StubClient([summary], SENT_RAW), store)
     data = ZohoMailboxData(context, folder)
-    assert data._messages[uid].zoho_id is None  # noqa: SLF001
+    assert data._messages[uid].zoho_id is None
 
     await Poller(context).sync_folder(data)
 
     assert store.get_message('77', uid).zoho_id == '999'
-    assert data._messages[uid].zoho_id == '999'  # noqa: SLF001
+    assert data._messages[uid].zoho_id == '999'
     # no second, duplicate message was added to the mailbox
-    assert len(data._messages) == 1  # noqa: PLR2004
+    assert len(data._messages) == 1
 
 
 async def test_remote_deletion_purges_store_and_memory() -> None:
@@ -84,7 +84,7 @@ async def test_remote_deletion_purges_store_and_memory() -> None:
     context = BridgeContext(BridgeSettings(prefetch=0),
                             StubClient([], b''), store)
     data = ZohoMailboxData(context, folder)
-    assert len(data._messages) == 1  # noqa: PLR2004
+    assert len(data._messages) == 1
 
     await Poller(context).sync_folder(data)
 

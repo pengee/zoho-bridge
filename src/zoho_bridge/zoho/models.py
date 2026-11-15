@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC
 
 __all__ = ['Folder', 'MessageSummary', 'Account']
 
@@ -39,7 +40,7 @@ class MessageSummary:
     starred: bool = False
 
     @classmethod
-    def from_view(cls, msg: dict) -> 'MessageSummary':
+    def from_view(cls, msg: dict) -> MessageSummary:
         zoho_id = str(msg.get('messageId') or msg.get('id') or '')
         subject = msg.get('subject')
         sender = msg.get('fromAddress') or msg.get('sender') or \
@@ -80,7 +81,6 @@ def _to_epoch(val) -> float | None:
             return num / 1000.0 if num > 1e12 else num
         try:
             from email.utils import parsedate_to_datetime
-            from datetime import timezone
             dt = parsedate_to_datetime(text)
         except (TypeError, ValueError):
             try:
@@ -89,7 +89,6 @@ def _to_epoch(val) -> float | None:
             except ValueError:
                 return None
         if dt.tzinfo is None:
-            from datetime import timezone
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt.timestamp()
     return None

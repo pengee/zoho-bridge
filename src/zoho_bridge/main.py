@@ -43,7 +43,7 @@ def _patch_proxy_protocol_task_retention() -> None:
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
 
-    ProxyProtocolReader._read_then_call = _read_then_call_keep
+    ProxyProtocolReader._read_then_call = _read_then_call_keep  # noqa: SLF001
 
 
 def main() -> None:

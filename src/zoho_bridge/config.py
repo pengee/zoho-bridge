@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from typing import Any, Final
 from pymap.config import BackendCapability, IMAPConfig
 
 __all__ = ['BridgeSettings', 'BridgeConfig']
+
+log = logging.getLogger(__name__)
 
 #: Zoho data center slug -> (accounts base, mail API base)
 DC_BASES: Final[dict[str, tuple[str, str]]] = {
@@ -32,9 +35,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
     try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
+        return int(raw)
+    except ValueError:
+        log.warning('ignoring non-integer %s=%r — using default %d',
+                    name, raw, default)
         return default
 
 
@@ -77,7 +85,7 @@ class BridgeSettings:
     accounts_base_override: str | None = None
 
     @classmethod
-    def from_env(cls) -> 'BridgeSettings':
+    def from_env(cls) -> BridgeSettings:
         dc = os.environ.get('ZOHO_DC', 'com').strip().lower()
         if dc not in DC_BASES:
             raise ValueError(f'unknown ZOHO_DC {dc!r}; '
@@ -125,6 +133,25 @@ class BridgeSettings:
             raise ValueError(
                 f'missing required environment variables: {", ".join(missing)}'
                 ' — see docs/zoho-oauth-setup.md')
+        problems: list[str] = []
+        if not 1 <= self.smtp_port <= 65535:
+            problems.append(f'BRIDGE_SMTP_PORT {self.smtp_port} out of range')
+        if not 1 <= self.health_port <= 65535:
+            problems.append(f'BRIDGE_HEALTH_PORT {self.health_port} out of range')
+        if self.full_scan_every < 1:
+            problems.append('BRIDGE_FULL_SCAN_EVERY must be >= 1')
+        if self.poll_seconds < 1:
+            problems.append('BRIDGE_POLL_SECONDS must be >= 1')
+        if self.raw_cache_mb < 1:
+            problems.append('BRIDGE_RAW_CACHE_MB must be >= 1')
+        if problems:
+            raise ValueError('invalid bridge configuration: '
+                             + '; '.join(problems))
+        if self.health_host not in ('127.0.0.1', 'localhost', '::1'):
+            log.warning('health/status endpoint bound to %s:%d and is '
+                        'unauthenticated — restrict to loopback unless a '
+                        'reverse proxy fronts it', self.health_host,
+                        self.health_port)
 
     @property
     def accounts_base(self) -> str:

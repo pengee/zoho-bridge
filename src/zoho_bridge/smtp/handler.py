@@ -18,7 +18,7 @@ from contextlib import AbstractAsyncContextManager
 from email import message_from_bytes
 from typing import Any
 
-from aiosmtpd.smtp import AuthResult, Envelope, LoginPassword, Session, SMTP
+from aiosmtpd.smtp import SMTP, AuthResult, Envelope, LoginPassword, Session
 
 from ..context import BridgeContext
 from ..mimeutil import addresses, split_mime
@@ -51,9 +51,9 @@ class SubmissionHandler:
     def authenticator(self, server: Any, session: Session,
                       envelope: Envelope, mechanism: str,
                       auth_data: Any) -> AuthResult:
-        if isinstance(auth_data, LoginPassword):
-            if self._check_credentials(auth_data.login, auth_data.password):
-                return AuthResult(success=True)
+        if isinstance(auth_data, LoginPassword) and self._check_credentials(
+                auth_data.login, auth_data.password):
+            return AuthResult(success=True)
         return AuthResult(success=False, handled=False)
 
     # -- envelope ----------------------------------------------------------
@@ -70,11 +70,11 @@ class SubmissionHandler:
                           envelope: Envelope) -> str:
         raw: bytes = envelope.original_content or b''
         try:
-            await self._submit(raw)
+            await self._submit(raw, envelope.mail_from)
         except _AttachmentUnavailable as exc:
             log.warning('submission rejected (attachments): %s', exc)
             return '451 4.7.0 Attachment upload to Zoho unavailable; try again later'
-        except Exception as exc:  # noqa: BLE001 - report as temporary failure
+        except Exception as exc:
             log.exception('submission failed')
             # collapse newlines: exception text can embed upstream HTTP
             # bodies, which would smuggle forged SMTP responses
@@ -83,7 +83,7 @@ class SubmissionHandler:
         self.context.wake_sync()
         return '250 Message accepted for delivery'
 
-    async def _submit(self, raw: bytes) -> None:
+    async def _submit(self, raw: bytes, mail_from: str = '') -> None:
         msg = message_from_bytes(raw)
         settings = self.context.settings
         client = self.context.client
@@ -95,7 +95,7 @@ class SubmissionHandler:
         from_addr = settings.account_address
         if not from_addr:
             account = await client.get_account()
-            from_addr = account.address or envelope.mail_from
+            from_addr = account.address or mail_from
 
         message_id = msg.get('Message-ID')
         if not message_id:

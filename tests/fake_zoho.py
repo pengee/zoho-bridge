@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import Any
 
 from aiohttp import web
 
@@ -110,7 +109,7 @@ class FakeZoho:
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, '127.0.0.1', 0)
         await self.site.start()
-        self.port = self.site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+        self.port = self.site._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
         if self.runner:
@@ -139,7 +138,7 @@ class FakeZoho:
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(self.start())
-            except BaseException as exc:  # noqa: BLE032
+            except BaseException as exc:  # noqa: BLE001 - report to caller
                 failed.append(exc)
                 ready.set()
                 return

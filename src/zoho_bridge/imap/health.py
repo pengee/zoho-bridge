@@ -58,7 +58,7 @@ class HealthServer:
             else:
                 await self._respond(writer, '404 Not Found', b'',
                                     'text/plain')
-        except (asyncio.TimeoutError, TimeoutError, ConnectionError):
+        except (TimeoutError, ConnectionError):
             pass
         finally:
             try:

@@ -59,7 +59,7 @@ if STALL_LOG:
         with open(STALL_LOG, 'a', encoding='utf-8') as fh:
             fh.write(f'[conn {time.monotonic():.2f}] {msg}\n')
 
-    from pymap.imap import IMAPServer  # noqa: E402
+    from pymap.imap import IMAPServer
 
     _orig_call = IMAPServer.__call__
 

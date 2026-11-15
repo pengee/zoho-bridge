@@ -63,8 +63,8 @@ def _op(store: Store, kind: str, **kw: object):
 
 
 def _get_op_row(store: Store, op_id: int):
-    with store._lock:  # noqa: SLF001 - test introspection
-        return store._conn.execute(  # noqa: SLF001
+    with store._lock:
+        return store._conn.execute(
             'SELECT * FROM outbox_ops WHERE op_id = ?', (op_id,)).fetchone()
 
 
@@ -75,10 +75,10 @@ def test_fail_backs_off_by_attempt_count() -> None:
     worker = _worker(store)
     op_id = store.enqueue_op('expunge',
                              payload={'zoho_ids': ['1'], 'folder_id': '77'})
-    with store._lock:  # noqa: SLF001
-        store._conn.execute(  # noqa: SLF001
+    with store._lock:
+        store._conn.execute(
             'UPDATE outbox_ops SET attempts = 3 WHERE op_id = ?', (op_id,))
-        store._conn.commit()  # noqa: SLF001
+        store._conn.commit()
     op = store.pop_due_ops()[0]
     assert op.attempts == 3
     worker._fail(op, ZohoApiError('DELETE', '/x', 500, 'boom'))
@@ -97,10 +97,10 @@ def test_fail_dead_after_max_attempts_clears_marker() -> None:
     worker = _worker(store)
     op_id = store.enqueue_op('upload_draft', zoho_folder_id='77', uid=5,
                              payload={})
-    with store._lock:  # noqa: SLF001
-        store._conn.execute(  # noqa: SLF001
+    with store._lock:
+        store._conn.execute(
             'UPDATE outbox_ops SET attempts = 9 WHERE op_id = ?', (op_id,))
-        store._conn.commit()  # noqa: SLF001
+        store._conn.commit()
     op = store.pop_due_ops()[0]
     worker._fail(op, ZohoApiError('POST', '/x', 500, 'boom'))
     assert _get_op_row(store, op_id)['status'] == 'dead'

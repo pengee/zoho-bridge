@@ -19,3 +19,5 @@ test_steps.log
 task_errors.log
 store_dump.txt
 debug_store.log
+.zcode/
+.ruff_cache/
