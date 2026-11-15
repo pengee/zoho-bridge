@@ -1,0 +1,27 @@
+# podman quadlet unit — install as /etc/containers/systemd/zoho-bridge.container
+# (rootful) or ~/.config/containers/systemd/zoho-bridge.container (rootless),
+# then: systemctl daemon-reload && systemctl start zoho-bridge
+#
+# Secrets live in the env file (mode 600) — see docs/zoho-oauth-setup.md:
+#   ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN,
+#   BRIDGE_IMAP_USER, BRIDGE_IMAP_PASSWORD
+
+[Unit]
+Description=Zoho Mail bridge (local IMAP/SMTP over the Zoho REST API)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/zoho-bridge:latest
+EnvironmentFile=/etc/zoho-bridge/env
+Volume=zoho-bridge-data:/data:Z
+PublishPort=1143:1143
+PublishPort=10587:10587
+PublishPort=127.0.0.1:8000:8000
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

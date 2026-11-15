@@ -1,0 +1,21 @@
+.vs/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# local state & secrets
+bridge.db*
+bridge-cert.pem
+bridge-key.pem
+*.env
+
+# dev/test artifacts
+pytest_run*.log
+test_steps.log
+task_errors.log
+store_dump.txt
+debug_store.log
