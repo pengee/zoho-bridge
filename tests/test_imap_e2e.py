@@ -15,6 +15,7 @@ import json
 import os
 import smtplib
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import time
 import urllib.request
 import uuid
 
-from fake_zoho import FakeZoho, simple_message
+from fake_zoho import (ACCESS_TOKEN, ACCOUNT_ID, FakeZoho, simple_message)
 from zoho_bridge.imap.backend import ZohoBackend  # noqa: F401 (sanity import)
 
 
@@ -112,6 +113,11 @@ class Harness:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
             self.proc = None
+
+    def restart(self, monkeypatch) -> None:
+        """Restart the bridge process against the same SQLite database."""
+        self.stop()
+        self.start(monkeypatch)
 
     def bridge_log_tail(self, lines: int = 40) -> str:
         if not self.log_path.exists():
@@ -269,6 +275,53 @@ def test_bridge_end_to_end(tmp_path, monkeypatch) -> None:
             return uids
 
         assert _reconnect() == uids_before, 'UIDs changed across reconnect'
+
+        # -- Zoho-side delete must not resurrect across restart --------------------
+        m3 = fake.seed_folder(fake.inbox_id,
+                              simple_message('Ghost test', 'ghost body'))
+
+        def _inbox_count() -> int:
+            client = imaplib.IMAP4('127.0.0.1', harness.imap_port)
+            try:
+                client.login('bridge', 'bridgepass')
+                typ, data = client.select('INBOX')
+                assert typ == 'OK', f'select INBOX: {data}'
+                return int(data[0])
+            finally:
+                try:
+                    client.logout()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+
+        assert_wait(harness, lambda: _inbox_count() == 1,
+                    'ghost-test message did not sync into INBOX')
+        req = urllib.request.Request(
+            f'{fake.api}/api/accounts/{ACCOUNT_ID}/folders/{fake.inbox_id}'
+            f'/messages/{m3.message_id}',
+            headers={'Authorization': f'Zoho-oauthtoken {ACCESS_TOKEN}'},
+            method='DELETE')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+        assert_wait(harness, lambda: _inbox_count() == 0,
+                    'Zoho-side delete did not propagate')
+        # the store must drop the row as well — memory-only removal lets
+        # ghosts resurrect on every restart until the first sync catches up
+        con = sqlite3.connect(
+            rf'file:{harness.tmp_path / "bridge.db"}?mode=ro', uri=True)
+        try:
+            # the Zoho delete trashes the message, so the poller will (and
+            # should) sync it into Trash — only the INBOX row must be gone
+            ghost_rows = con.execute(
+                "SELECT COUNT(*) FROM messages m "
+                "JOIN folders f ON f.zoho_id = m.zoho_folder_id "
+                "WHERE m.subject = 'Ghost test' "
+                "AND f.imap_name = 'INBOX'").fetchone()[0]
+        finally:
+            con.close()
+        assert ghost_rows == 0, 'Zoho-side delete left a row in the store'
+        harness.restart(monkeypatch)
+        assert _inbox_count() == 0, \
+            'Zoho-side delete resurrected from the store after restart'
 
         # -- health endpoint -----------------------------------------------------------
         with urllib.request.urlopen(

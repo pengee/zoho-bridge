@@ -193,7 +193,10 @@ class Poller:
                 store.set_zoho_id(zoho_id, linked.uid, zoho_msg_id)
                 refreshed = store.get_message(zoho_id, linked.uid)
                 if refreshed is not None:
-                    added_rows.append(refreshed)  # type: ignore[arg-type]
+                    # also swap the live in-memory Message, otherwise its
+                    # zoho_id stays None and flag/expunge ops on this copy
+                    # silently stop reaching Zoho until a restart
+                    data.refresh_row(refreshed)
                 log.debug('linked sent copy %s to local uid %d',
                           zoho_msg_id, linked.uid)
             else:
@@ -204,6 +207,10 @@ class Poller:
         if added_rows or flag_rows or removed:
             log.debug('%s: +%d ~%d -%d', folder.imap_name, len(added_rows),
                       len(flag_rows), len(removed))
+            if removed:
+                # purge the store rows too, or Zoho-side deletions
+                # resurrect from _load_from_store on every restart
+                store.delete_messages(zoho_id, removed)
             await data.apply_remote(added_rows, flag_rows, removed)
         await self._prefetch(data, added_rows)
 
