@@ -33,7 +33,16 @@ class BridgeContext:
         self.sync_wake: asyncio.Event | None = None
         self.last_sync_epoch: float = 0.0
         self.sync_ok: bool = False
+        # per-folder poll-cycle counters (in-memory by design: a restart
+        # resets them so the first pass over every folder is a full sweep)
+        self.folder_cycles: dict[str, int] = {}
 
     def wake_sync(self) -> None:
         if self.sync_wake is not None:
             self.sync_wake.set()
+
+    def next_folder_cycle(self, zoho_id: str) -> int:
+        """Return (and increment) the sync-cycle count of a folder."""
+        cycle = self.folder_cycles.get(zoho_id, 0)
+        self.folder_cycles[zoho_id] = cycle + 1
+        return cycle

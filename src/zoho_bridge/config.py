@@ -55,6 +55,9 @@ class BridgeSettings:
     db_path: str = 'bridge.db'
     poll_seconds: int = 120
     prefetch: int = 25
+    #: full folder sweeps (deletion + stale-flag reconciliation) run every
+    #: N poll cycles; incremental cycles only page for new arrivals
+    full_scan_every: int = 10
     raw_cache_mb: int = 512
     smtp_port: int = 10587
     smtp_host: str = '0.0.0.0'
@@ -95,6 +98,7 @@ class BridgeSettings:
             db_path=os.environ.get('BRIDGE_DB_PATH', 'bridge.db'),
             poll_seconds=_env_int('BRIDGE_POLL_SECONDS', 120),
             prefetch=_env_int('BRIDGE_PREFETCH', 25),
+            full_scan_every=_env_int('BRIDGE_FULL_SCAN_EVERY', 10),
             raw_cache_mb=_env_int('BRIDGE_RAW_CACHE_MB', 512),
             smtp_port=_env_int('BRIDGE_SMTP_PORT', 10587),
             smtp_host=os.environ.get('BRIDGE_SMTP_HOST', '0.0.0.0'),

@@ -77,6 +77,47 @@ def test_raw_cache_and_prune(tmp_path) -> None:
     assert store.load_raw('F1', uid) is None
 
 
+def test_raw_cache_counter_tracks_all_mutations(tmp_path) -> None:
+    """The O(1) counter must equal the real BLOB sum across store/update/
+    delete/folder-delete, and be re-derived from disk on reopen."""
+    path = str(tmp_path / 't.db')
+    store = Store(path)
+    store.upsert_folder(zoho_id='F1', imap_name='INBOX')
+    store.upsert_folder(zoho_id='F2', imap_name='Sent')
+    u1 = store.alloc_uids('F1')[0]
+    u2 = store.alloc_uids('F1')[0]
+    u3 = store.alloc_uids('F2')[0]
+    for uid, fid in ((u1, 'F1'), (u2, 'F1'), (u3, 'F2')):
+        store.upsert_message(MessageRow(zoho_folder_id=fid, uid=uid))
+    store.store_raw('F1', u1, b'a' * 100)
+    store.store_raw('F1', u2, b'b' * 200)
+    store.store_raw('F2', u3, b'c' * 300)
+    assert store.raw_cache_size() == 600
+    store.store_raw('F1', u1, b'a' * 50)  # overwrite shrinks
+    assert store.raw_cache_size() == 550
+    store.delete_messages('F1', [u2])
+    assert store.raw_cache_size() == 350
+    store.close()
+    reopened = Store(path)
+    assert reopened.raw_cache_size() == 350  # boot scan re-derives
+    reopened.delete_folder('F2')
+    assert reopened.raw_cache_size() == 50   # folder raw purged from count
+    reopened.close()
+
+
+def test_prune_frees_only_what_is_needed(tmp_path) -> None:
+    store = Store(str(tmp_path / 't.db'))
+    store.upsert_folder(zoho_id='F1', imap_name='INBOX')
+    uids = store.alloc_uids('F1', 3)
+    for uid in uids:
+        store.upsert_message(MessageRow(zoho_folder_id='F1', uid=uid))
+        store.store_raw('F1', uid, b'x' * 100)
+    assert store.raw_cache_size() == 300
+    freed = store.prune_raw_cache(max_bytes=200)
+    assert freed == 100  # one victim suffices
+    assert store.raw_cache_size() == 200
+
+
 def test_ops_lifecycle(tmp_path) -> None:
     store = Store(str(tmp_path / 't.db'))
     op_id = store.enqueue_op('flag_read', zoho_folder_id='F1', uid=1,

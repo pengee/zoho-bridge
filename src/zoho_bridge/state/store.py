@@ -138,6 +138,12 @@ class Store:
             self._conn.execute('PRAGMA synchronous=NORMAL')
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+            # one-shot boot scan; kept exact via deltas afterwards so the
+            # hot paths (cache size check, prune) never rescan the BLOBs
+            row = self._conn.execute(
+                'SELECT COALESCE(SUM(LENGTH(raw)), 0) FROM messages '
+                'WHERE raw IS NOT NULL').fetchone()
+            self._raw_bytes = int(row[0])
 
     def close(self) -> None:
         with self._lock:
@@ -207,6 +213,11 @@ class Store:
 
     def delete_folder(self, zoho_id: str) -> None:
         with self._lock, self._conn:
+            row = self._conn.execute(
+                'SELECT COALESCE(SUM(LENGTH(raw)), 0) FROM messages '
+                'WHERE zoho_folder_id = ? AND raw IS NOT NULL',
+                (zoho_id,)).fetchone()
+            self._raw_bytes -= int(row[0])
             self._conn.execute('DELETE FROM messages '
                                'WHERE zoho_folder_id = ?', (zoho_id,))
             self._conn.execute('DELETE FROM folders WHERE zoho_id = ?',
@@ -288,7 +299,16 @@ class Store:
                 (pending_op, zoho_folder_id, uid))
 
     def delete_messages(self, zoho_folder_id: str, uids: list[int]) -> None:
+        if not uids:
+            return
         with self._lock, self._conn:
+            rows = self._conn.execute(
+                'SELECT uid, COALESCE(LENGTH(raw), 0) AS len FROM messages '
+                'WHERE zoho_folder_id = ? AND raw IS NOT NULL',
+                (zoho_folder_id,)).fetchall()
+            doomed = set(uids)
+            self._raw_bytes -= sum(int(r['len']) for r in rows
+                                   if r['uid'] in doomed)
             self._conn.executemany(
                 'DELETE FROM messages WHERE zoho_folder_id = ? AND uid = ?',
                 [(zoho_folder_id, uid) for uid in uids])
@@ -309,11 +329,19 @@ class Store:
     # -- raw body cache ------------------------------------------------------
 
     def store_raw(self, zoho_folder_id: str, uid: int, raw: bytes) -> None:
+        new_len = len(raw)
         with self._lock, self._conn:
+            prev = self._conn.execute(
+                'SELECT COALESCE(LENGTH(raw), 0) FROM messages '
+                'WHERE zoho_folder_id = ? AND uid = ?',
+                (zoho_folder_id, uid)).fetchone()
+            if prev is None:
+                return  # no such row; the UPDATE below would no-op anyway
             self._conn.execute(
                 'UPDATE messages SET raw = ?, raw_last_access = ? '
                 'WHERE zoho_folder_id = ? AND uid = ?',
                 (sqlite3.Binary(raw), time.time(), zoho_folder_id, uid))
+            self._raw_bytes += new_len - int(prev[0])
 
     def load_raw(self, zoho_folder_id: str, uid: int) -> bytes | None:
         with self._lock:
@@ -330,35 +358,41 @@ class Store:
         return bytes(row['raw'])
 
     def raw_cache_size(self) -> int:
+        """Total cached raw-body bytes (maintained counter — no table scan)."""
         with self._lock:
-            row = self._conn.execute(
-                'SELECT COALESCE(LENGTH(raw), 0) AS total FROM messages '
-                'WHERE raw IS NOT NULL').fetchall()
-        return sum(int(r['total']) for r in row)
+            return self._raw_bytes
 
     def prune_raw_cache(self, max_bytes: int) -> int:
         """Evict least-recently-accessed raw bodies until under budget.
         Returns bytes freed."""
-        freed = 0
+        freed_total = 0
         while True:
-            size = self.raw_cache_size()
-            if size <= max_bytes:
-                break
             with self._lock, self._conn:
-                victim = self._conn.execute(
+                if self._raw_bytes <= max_bytes:
+                    break
+                rows = self._conn.execute(
                     'SELECT zoho_folder_id, uid, LENGTH(raw) AS len '
                     'FROM messages WHERE raw IS NOT NULL AND pending_op '
-                    'IS NULL ORDER BY raw_last_access ASC LIMIT 1').fetchone()
-                if victim is None:
+                    'IS NULL ORDER BY raw_last_access ASC LIMIT 2000'
+                ).fetchall()
+                if not rows:
                     break
-                self._conn.execute(
+                target = self._raw_bytes - max_bytes
+                doomed: list[tuple[str, int]] = []
+                page_freed = 0
+                for r in rows:
+                    doomed.append((r['zoho_folder_id'], int(r['uid'])))
+                    page_freed += int(r['len'] or 0)
+                    if page_freed >= target:
+                        break
+                if not doomed or page_freed == 0:
+                    break  # nothing left to free (all zero-length)
+                self._conn.executemany(
                     'UPDATE messages SET raw = NULL, raw_last_access = NULL '
-                    'WHERE zoho_folder_id = ? AND uid = ?',
-                    (victim['zoho_folder_id'], victim['uid']))
-                freed += int(victim['len'] or 0)
-            if not victim['len']:
-                break
-        return freed
+                    'WHERE zoho_folder_id = ? AND uid = ?', doomed)
+                self._raw_bytes -= page_freed
+                freed_total += page_freed
+        return freed_total
 
     # -- outbox ops -----------------------------------------------------------
 

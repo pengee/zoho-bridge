@@ -13,7 +13,7 @@ import time
 import pytest
 
 from zoho_bridge.config import BridgeSettings
-from zoho_bridge.imap.backend import BridgeContext
+from zoho_bridge.context import BridgeContext
 from zoho_bridge.poller import OpsWorker
 from zoho_bridge.state.store import MessageRow, Store
 from zoho_bridge.zoho.client import ZohoApiError
@@ -190,3 +190,64 @@ async def test_file_sent_uploads_and_moves_when_unfiled() -> None:
     assert row.zoho_id == '999'
     assert row.pending_op is None
     assert client.saved and client.moved
+
+
+# -- coalescing (P3) ------------------------------------------------------
+
+class BatchClient:
+    def __init__(self) -> None:
+        self.read_batches: list[tuple[list[str], bool]] = []
+        self.star_batches: list[tuple[list[str], bool]] = []
+        self.expunge_batches: list[tuple[list[str], str]] = []
+
+    async def mark_read(self, message_ids, *, read):
+        self.read_batches.append((sorted(message_ids), read))
+        return True
+
+    async def set_star(self, message_ids, *, starred):
+        self.star_batches.append((sorted(message_ids), starred))
+        return True
+
+    async def delete_messages(self, message_ids, folder_id):
+        self.expunge_batches.append((sorted(message_ids), folder_id))
+        return True
+
+
+async def test_flag_and_expunge_ops_are_coalesced() -> None:
+    """Bulk flag/expunge changes collapse to one API call each (by value /
+    by folder), not N calls."""
+    store = _make_store()
+    client = BatchClient()
+    worker = _worker(store, client)
+    store.enqueue_op('flag_read', payload={'zoho_id': 'M1', 'read': True})
+    store.enqueue_op('flag_read', payload={'zoho_id': 'M2', 'read': True})
+    store.enqueue_op('flag_read', payload={'zoho_id': 'M3', 'read': False})
+    store.enqueue_op('flag_star', payload={'zoho_id': 'M4', 'starred': True})
+    store.enqueue_op('expunge',
+                     payload={'zoho_ids': ['M5', 'M6'], 'folder_id': '77'})
+    store.enqueue_op('expunge',
+                     payload={'zoho_ids': ['M7'], 'folder_id': '88'})
+    await worker.drain(store.pop_due_ops(limit=50))
+    assert client.read_batches == [(['M1', 'M2'], True), (['M3'], False)]
+    assert client.star_batches == [(['M4'], True)]
+    assert client.expunge_batches == [(['M5', 'M6'], '77'), (['M7'], '88')]
+    assert store.pop_due_ops() == []
+
+
+async def test_coalesced_group_failure_fails_each_op() -> None:
+    store = _make_store()
+
+    class BoomClient(BatchClient):
+        async def mark_read(self, message_ids, *, read):
+            raise ZohoApiError('PUT', '/updatemessage', 500, 'boom')
+
+    worker = _worker(store, BoomClient())
+    ids = [store.enqueue_op('flag_read',
+                            payload={'zoho_id': f'M{i}', 'read': True})
+           for i in range(3)]
+    await worker.drain(store.pop_due_ops(limit=50))
+    # every op in the failed batch is retried (pending, attempts bumped)
+    pending, dead = store.op_counts()
+    assert (pending, dead) == (3, 0)
+    for op_id in ids:
+        assert _get_op_row(store, op_id)['attempts'] == 1

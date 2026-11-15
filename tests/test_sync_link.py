@@ -12,7 +12,8 @@ from __future__ import annotations
 import time
 
 from zoho_bridge.config import BridgeSettings
-from zoho_bridge.imap.backend import BridgeContext, ZohoMailboxData
+from zoho_bridge.context import BridgeContext
+from zoho_bridge.imap.backend import ZohoMailboxData
 from zoho_bridge.poller import Poller
 from zoho_bridge.state.store import MessageRow, Store
 from zoho_bridge.zoho.models import MessageSummary
@@ -89,3 +90,61 @@ async def test_remote_deletion_purges_store_and_memory() -> None:
 
     assert store.get_message('77', uid) is None
     assert len(data._messages) == 0
+
+
+class PagingClient:
+    def __init__(self, by_start: dict[int, list[MessageSummary]]) -> None:
+        self.by_start = by_start
+        self.requested: list[int] = []
+
+    async def list_messages(self, folder_id: str, *, limit: int = 50,
+                            start: int = 0) -> list[MessageSummary]:
+        self.requested.append(start)
+        return self.by_start.get(start, [])
+
+    async def fetch_original(self, message_id: str) -> bytes:
+        return b''
+
+
+def _summaries(ids: list[str]) -> list[MessageSummary]:
+    return [MessageSummary(zoho_id=i, subject=i) for i in ids]
+
+
+async def test_incremental_stops_paging_and_defers_deletes(
+        monkeypatch) -> None:
+    """P1: an incremental cycle stops at the first fully-known page and,
+    because that view is partial, must not treat missing messages as
+    deletions; the next full sweep sees the exhausted listing and deletes."""
+    monkeypatch.setattr('zoho_bridge.poller.PAGE_SIZE', 2)
+    store = Store(':memory:')
+    folder = store.upsert_folder(zoho_id='77', imap_name='INBOX',
+                                 zoho_name='Inbox')
+    client = PagingClient({0: _summaries(['A', 'B']),
+                           2: _summaries(['C', 'D'])})
+    ctx = BridgeContext(BridgeSettings(prefetch=0, full_scan_every=2),
+                        client, store)
+    data = ZohoMailboxData(ctx, folder)
+
+    # cycle 0 — full sweep: pages 0, 2, then the terminating empty page
+    await Poller(ctx).sync_folder(data)
+    assert client.requested == [0, 2, 4]
+    assert {r.zoho_id for r in store.load_messages('77')} == \
+        {'A', 'B', 'C', 'D'}
+
+    # C,D vanish on Zoho — only the first page remains
+    client.by_start = {0: _summaries(['A', 'B'])}
+    client.requested.clear()
+
+    # cycle 1 — incremental: page 0 is fully known -> stop paging after
+    # one call; partial view must NOT delete C/D
+    await Poller(ctx).sync_folder(data)
+    assert client.requested == [0]
+    assert {r.zoho_id for r in store.load_messages('77')} == \
+        {'A', 'B', 'C', 'D'}
+
+    # cycle 2 — full sweep: page 0 then the now-empty page 2 exhausts the
+    # listing, so the deletions finally apply
+    client.requested.clear()
+    await Poller(ctx).sync_folder(data)
+    assert client.requested == [0, 2]
+    assert {r.zoho_id for r in store.load_messages('77')} == {'A', 'B'}

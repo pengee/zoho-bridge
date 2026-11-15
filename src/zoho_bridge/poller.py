@@ -113,21 +113,41 @@ class Poller:
         folder = data.folder
         zoho_id = folder.zoho_id
 
+        # Zoho's view ordering is not guaranteed and older messages carry
+        # stale-flag updates too, so deletion detection and full flag
+        # reconciliation only trust a complete listing: between full sweeps
+        # (BRIDGE_FULL_SCAN_EVERY cycles) we page just far enough to catch
+        # new arrivals and stop at the first fully-known page
+        cycle = context.next_folder_cycle(zoho_id)
+        full_scan = cycle % max(1, context.settings.full_scan_every) == 0
+
+        existing = {row.zoho_id: row
+                    for row in store.load_messages(zoho_id) if row.zoho_id}
+        known_ids = set(existing)
+
         remote: dict[str, Any] = {}
         start = 0
+        view_complete = True
         for _ in range(MAX_PAGES):
             summaries = await context.client.list_messages(
                 zoho_id, limit=PAGE_SIZE, start=start)
             if not summaries:
                 break
+            page_new = 0
             for summary in summaries:
+                if summary.zoho_id not in known_ids:
+                    page_new += 1
+                    known_ids.add(summary.zoho_id)
                 remote[summary.zoho_id] = summary
             if len(summaries) < PAGE_SIZE:
-                break
+                break  # exhausted the folder
+            if not full_scan and page_new == 0:
+                view_complete = False
+                break  # incremental: this page held no new arrivals
             start += PAGE_SIZE
+        else:
+            view_complete = False  # hit MAX_PAGES without exhausting
 
-        existing = {row.zoho_id: row
-                    for row in store.load_messages(zoho_id) if row.zoho_id}
         # rows with in-flight local writes: Zoho state is stale for these
         # until the ops worker drains them — never reconcile from Zoho now
         pending_uids = store.pending_uids(zoho_id)
@@ -161,9 +181,15 @@ class Poller:
                     updated = row.with_flags(desired_flags)
                     store.set_flags(zoho_id, row.uid, desired_flags)
                     flag_rows.append(updated)
-        removed = [row.uid for zoho_msg_id, row in existing.items()
-                   if zoho_msg_id not in remote and not row.pending_op
-                   and row.uid not in pending_uids]
+        # safety rule: deletion detection requires a complete listing —
+        # an early-stopped incremental window (or a MAX_PAGES-truncated
+        # sweep) must never be interpreted as mass deletion
+        if view_complete:
+            removed = [row.uid for zoho_msg_id, row in existing.items()
+                       if zoho_msg_id not in remote and not row.pending_op
+                       and row.uid not in pending_uids]
+        else:
+            removed = []
 
         # Sent folder: link the Zoho copy of a message we already appended
         # locally (Nextcloud Mail saves its sent copy via APPEND).
@@ -252,21 +278,69 @@ class OpsWorker:
 
     async def run_forever(self) -> None:
         while True:
-            ops = self.context.store.pop_due_ops(limit=20)
+            ops = self.context.store.pop_due_ops(limit=50)
             if not ops:
                 await asyncio.sleep(5.0)
                 continue
+            await self.drain(ops)
+
+    async def drain(self, ops: list[Any]) -> None:
+        """Apply due ops, coalescing flag and expunge ops — Zoho's
+        ``updatemessage`` and the delete endpoint both take id lists, so a
+        bulk flag change is one API call instead of N."""
+        flag_read: dict[bool, list[Any]] = {True: [], False: []}
+        flag_star: dict[bool, list[Any]] = {True: [], False: []}
+        expunge: dict[str, list[Any]] = {}
+        singles: list[Any] = []
+        for op in ops:
+            if op.kind == 'flag_read':
+                flag_read[bool(op.payload.get('read'))].append(op)
+            elif op.kind == 'flag_star':
+                flag_star[bool(op.payload.get('starred'))].append(op)
+            elif op.kind == 'expunge':
+                expunge.setdefault(str(op.payload.get('folder_id')),
+                                   []).append(op)
+            else:
+                singles.append(op)
+        for read_val, group in flag_read.items():
+            if group:
+                ids = [op.payload['zoho_id'] for op in group]
+                await self._run_group(
+                    group, lambda ids=ids, v=read_val:
+                    self.context.client.mark_read(ids, read=v))
+        for star_val, group in flag_star.items():
+            if group:
+                ids = [op.payload['zoho_id'] for op in group]
+                await self._run_group(
+                    group, lambda ids=ids, v=star_val:
+                    self.context.client.set_star(ids, starred=v))
+        for folder_id, group in expunge.items():
+            ids = [zid for op in group for zid in op.payload['zoho_ids']]
+            await self._run_group(
+                group, lambda ids=ids, fid=folder_id:
+                self.context.client.delete_messages(ids, fid))
+        for op in singles:
+            try:
+                await self.apply(op)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self._fail(op, exc)
+            else:
+                self.context.store.op_done(op.op_id)
+
+    async def _run_group(self, ops: list[Any], invoke: Any) -> None:
+        """Run one batched API call on behalf of a group of ops."""
+        try:
+            await invoke()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
             for op in ops:
-                try:
-                    await self.apply(op)
-                except asyncio.CancelledError:
-                    raise
-                except ZohoApiError as exc:
-                    self._fail(op, exc)
-                except Exception as exc:  # noqa: BLE001
-                    self._fail(op, exc)
-                else:
-                    self.context.store.op_done(op.op_id)
+                self._fail(op, exc)
+        else:
+            for op in ops:
+                self.context.store.op_done(op.op_id)
 
     def _fail(self, op: Any, exc: Exception) -> None:
         attempts = op.attempts + 1
