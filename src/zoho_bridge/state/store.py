@@ -32,7 +32,6 @@ class FolderRow:
     mailbox_id: str
     uid_validity: int
     uid_next: int = 1
-    deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,8 +88,7 @@ CREATE TABLE IF NOT EXISTS folders (
     zoho_name TEXT NOT NULL,
     mailbox_id TEXT NOT NULL,
     uid_validity INTEGER NOT NULL,
-    uid_next INTEGER NOT NULL DEFAULT 1,
-    deleted INTEGER NOT NULL DEFAULT 0
+    uid_next INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS messages (
     zoho_folder_id TEXT NOT NULL,
@@ -182,29 +180,28 @@ class Store:
                      uid_validity or new_uid_validity()))
             else:
                 self._conn.execute(
-                    'UPDATE folders SET zoho_id = ?, zoho_name = ?, '
-                    'deleted = 0 WHERE imap_name = ?',
+                    'UPDATE folders SET zoho_id = ?, zoho_name = ? '
+                    'WHERE imap_name = ?',
                     (zoho_id, zoho_name, imap_name))
         return self.get_folder_by_name(imap_name)  # type: ignore[return-value]
 
     def list_folders(self) -> list[FolderRow]:
         with self._lock:
             rows = self._conn.execute(
-                'SELECT * FROM folders WHERE deleted = 0 '
-                'ORDER BY imap_name').fetchall()
+                'SELECT * FROM folders ORDER BY imap_name').fetchall()
         return [_folder_row(r) for r in rows]
 
     def get_folder_by_name(self, imap_name: str) -> FolderRow | None:
         with self._lock:
             row = self._conn.execute(
-                'SELECT * FROM folders WHERE imap_name = ? AND deleted = 0',
+                'SELECT * FROM folders WHERE imap_name = ?',
                 (imap_name,)).fetchone()
         return _folder_row(row) if row else None
 
     def get_folder_by_zoho_id(self, zoho_id: str) -> FolderRow | None:
         with self._lock:
             row = self._conn.execute(
-                'SELECT * FROM folders WHERE zoho_id = ? AND deleted = 0',
+                'SELECT * FROM folders WHERE zoho_id = ?',
                 (zoho_id,)).fetchone()
         return _folder_row(row) if row else None
 
@@ -214,12 +211,6 @@ class Store:
                                'WHERE zoho_folder_id = ?', (zoho_id,))
             self._conn.execute('DELETE FROM folders WHERE zoho_id = ?',
                                (zoho_id,))
-
-    def mark_folder_deleted(self, imap_name: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                'UPDATE folders SET deleted = 1 WHERE imap_name = ?',
-                (imap_name,))
 
     # -- messages -----------------------------------------------------------
 
@@ -236,13 +227,6 @@ class Store:
                 'UPDATE folders SET uid_next = ? WHERE zoho_id = ?',
                 (start + count, zoho_folder_id))
         return list(range(start, start + count))
-
-    def get_uid_next(self, zoho_folder_id: str) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                'SELECT uid_next FROM folders WHERE zoho_id = ?',
-                (zoho_folder_id,)).fetchone()
-        return int(row['uid_next']) if row else 1
 
     def load_messages(self, zoho_folder_id: str) -> list[MessageRow]:
         with self._lock:
@@ -308,15 +292,6 @@ class Store:
             self._conn.executemany(
                 'DELETE FROM messages WHERE zoho_folder_id = ? AND uid = ?',
                 [(zoho_folder_id, uid) for uid in uids])
-
-    def find_by_zoho_id(self, zoho_id: str) -> MessageRow | None:
-        with self._lock:
-            row = self._conn.execute(
-                'SELECT zoho_folder_id, uid, zoho_id, message_id, flags, '
-                'internal_date, size, subject, sender, '
-                '(raw IS NOT NULL) AS has_raw, pending_op '
-                'FROM messages WHERE zoho_id = ?', (zoho_id,)).fetchone()
-        return _message_row(row) if row else None
 
     def find_by_message_id(self, message_id: str | None) \
             -> list[MessageRow]:
@@ -465,6 +440,14 @@ class Store:
                 (attempts, time.time() + delay, op_id))
         return True
 
+    def op_counts(self) -> tuple[int, int]:
+        """Return ``(pending, dead)`` outbox op counts."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT SUM(status = 'pending') AS pending, "
+                "SUM(status = 'dead') AS dead FROM outbox_ops").fetchone()
+        return int(row['pending'] or 0), int(row['dead'] or 0)
+
 
 def _dumps(payload: dict) -> str:
     return json.dumps(payload)
@@ -482,8 +465,7 @@ def _folder_row(r: sqlite3.Row) -> FolderRow:
     return FolderRow(zoho_id=r['zoho_id'], imap_name=r['imap_name'],
                      zoho_name=r['zoho_name'], mailbox_id=r['mailbox_id'],
                      uid_validity=int(r['uid_validity']),
-                     uid_next=int(r['uid_next']),
-                     deleted=bool(r['deleted']))
+                     uid_next=int(r['uid_next']))
 
 
 def _message_row(r: sqlite3.Row) -> MessageRow:

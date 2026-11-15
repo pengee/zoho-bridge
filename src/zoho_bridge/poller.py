@@ -11,14 +11,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import email.utils
-from email import message_from_bytes
-from email.message import Message as MimeMessage
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .state.store import FolderRow, MessageRow
+from .context import BridgeContext
+from .mimeutil import build_draft_payload, extract_message_id
+from .state.store import MessageRow
 from .zoho.client import ZohoApiError, ZohoClient
-from .imap.backend import BridgeContext, ZohoMailboxData
+
+if TYPE_CHECKING:
+    from .imap.backend import ZohoMailboxData
 
 __all__ = ['Poller', 'OpsWorker']
 
@@ -169,7 +170,7 @@ class Poller:
         for new_row, summary in sent_dedupe:
             zoho_msg_id = new_row.zoho_id
             raw = await context.client.fetch_original(zoho_msg_id)
-            msg_id = _extract_message_id(raw)
+            msg_id = extract_message_id(raw)
             linked = None
             if msg_id:
                 for candidate in store.find_by_message_id(msg_id):
@@ -243,14 +244,6 @@ class Poller:
             pass
 
 
-def _extract_message_id(raw: bytes) -> str | None:
-    try:
-        msg = message_from_bytes(raw)
-    except Exception:  # noqa: BLE001 - malformed message
-        return None
-    return msg.get('Message-ID')
-
-
 class OpsWorker:
     """Drains the outbox of pending Zoho write operations."""
 
@@ -299,12 +292,10 @@ class OpsWorker:
         payload = op.payload
         if kind == 'flag_read':
             await client.mark_read([payload['zoho_id']],
-                                   read=payload['read'],
-                                   folder_id=payload.get('folder_id'))
+                                   read=payload['read'])
         elif kind == 'flag_star':
             await client.set_star([payload['zoho_id']],
-                                  starred=payload['starred'],
-                                  folder_id=payload.get('folder_id'))
+                                  starred=payload['starred'])
         elif kind == 'expunge':
             await client.delete_messages(payload['zoho_ids'],
                                          payload['folder_id'])
@@ -334,7 +325,7 @@ class OpsWorker:
                         op.uid)
             clear_marker()
             return
-        payload = _draft_payload(raw)
+        payload = build_draft_payload(raw)
         if payload is None:
             log.warning('draft uid %d: unparseable MIME, upload dropped',
                         op.uid)
@@ -372,14 +363,14 @@ class OpsWorker:
                         op.uid)
             clear_marker()
             return
-        msg_id = _extract_message_id(raw)
+        msg_id = extract_message_id(raw)
         if msg_id:
             for candidate in store.find_by_message_id(msg_id):
                 if candidate.zoho_folder_id == op.zoho_folder_id and \
                         candidate.zoho_id:
                     clear_marker()
                     return  # Zoho copy already linked by the poller
-        payload = _draft_payload(raw)
+        payload = build_draft_payload(raw)
         if payload is None:
             log.warning('sent-copy uid %d: unparseable MIME, filing dropped',
                         op.uid)
@@ -394,44 +385,3 @@ class OpsWorker:
                     [draft_id], to_folder_id=sent.zoho_id)
                 store.set_zoho_id(op.zoho_folder_id, op.uid, draft_id)
         clear_marker()
-
-
-def _draft_payload(raw: bytes) -> dict | None:
-    """Build the JSON payload for the drafts API from a raw MIME message."""
-    try:
-        msg: MimeMessage = message_from_bytes(raw)
-    except Exception:  # noqa: BLE001
-        return None
-    to = ', '.join(addr for _, addr in
-                   email.utils.getaddresses(msg.get_all('To', [])))
-    subject = msg.get('Subject') or ''
-    body_text = ''
-    body_html = None
-    if not msg.is_multipart():
-        payload = msg.get_payload(decode=True) or b''
-        charset = msg.get_content_charset() or 'utf-8'
-        text = payload.decode(charset, 'replace')
-        if msg.get_content_type() == 'text/html':
-            body_html = text
-        else:
-            body_text = text
-    else:
-        for part in msg.walk():
-            if part.is_multipart():
-                continue
-            ctype = part.get_content_type()
-            if ctype == 'text/plain' and not body_text:
-                payload = part.get_payload(decode=True) or b''
-                charset = part.get_content_charset() or 'utf-8'
-                body_text = payload.decode(charset, 'replace')
-    from_addr = ''
-    if msg.get('From'):
-        _, from_addr = email.utils.getaddresses([msg['From']])[0]
-    return {
-        'fromAddress': from_addr,
-        'toAddress': to,
-        'subject': subject,
-        'content': body_html or body_text,
-        'mailFormat': 'html' if body_html else 'plaintext',
-        'encoding': 'UTF-8',
-    }

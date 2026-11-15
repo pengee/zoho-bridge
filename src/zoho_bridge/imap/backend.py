@@ -48,12 +48,16 @@ from pymap.token import AllTokens
 from pymap.user import UserMetadata
 
 from ..config import BridgeConfig, BridgeSettings
+from ..context import BridgeContext
+from ..poller import OpsWorker, Poller
+from ..smtp.handler import SubmissionServer
 from ..state.store import FolderRow, MessageRow, Store, \
     normalize_message_id
 from ..zoho.client import ZohoClient
 from ..zoho.models import Folder
+from .health import HealthServer
 
-__all__ = ['ZohoBackend', 'BridgeContext']
+__all__ = ['ZohoBackend']
 
 log = logging.getLogger(__name__)
 
@@ -506,8 +510,7 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
     def _queue_flag_ops(self, uid: int, zoho_id: str,
                         old: frozenset[Flag],
                         new: frozenset[Flag]) -> None:
-        payload_base = {'zoho_id': zoho_id,
-                        'folder_id': self._folder.zoho_id}
+        payload_base = {'zoho_id': zoho_id}
         if Seen in new and Seen not in old:
             self._context.store.enqueue_op(
                 'flag_read', zoho_folder_id=self._folder.zoho_id, uid=uid,
@@ -745,26 +748,6 @@ class Identity(IdentityInterface):
         raise NotAllowedError('bridge users are static')
 
 
-class BridgeContext:
-    """Shared services for one running bridge instance."""
-
-    def __init__(self, settings: BridgeSettings, client: ZohoClient,
-                 store: Store) -> None:
-        self.settings = settings
-        self.client = client
-        self.store = store
-        self.mailbox_set: ZohoMailboxSet | None = None
-        # plain asyncio.Event on purpose: pymap's Event leaks one orphaned
-        # inner task per wait(timeout=...) call (alpha bug, Python 3.14)
-        self.sync_wake: asyncio.Event | None = None
-        self.last_sync_epoch: float = 0.0
-        self.sync_ok: bool = False
-
-    def wake_sync(self) -> None:
-        if self.sync_wake is not None:
-            self.sync_wake.set()
-
-
 class ZohoBackend(BackendInterface):
     """Defines the backend that bridges IMAP to a Zoho Mail account."""
 
@@ -899,10 +882,6 @@ class ZohoBackend(BackendInterface):
         self._login.set_mailbox_set(mailbox_set)
 
         # background workers
-        from ..poller import Poller, OpsWorker
-        from ..smtp.handler import SubmissionServer
-        from .health import HealthServer
-
         poller = Poller(context)
         ops = OpsWorker(context)
         smtp = SubmissionServer(context)

@@ -266,8 +266,8 @@ class ZohoClient:
                                str(data)[:300])
         return _find_id(data)
 
-    async def mark_read(self, message_ids: list[str], *, read: bool,
-                        folder_id: str | None = None) -> bool:
+    async def mark_read(self, message_ids: list[str], *,
+                        read: bool) -> bool:
         mode = 'markAsRead' if read else 'markAsUnread'
         aid = (await self.get_account()).account_id
         body = {'mode': mode,
@@ -276,8 +276,8 @@ class ZohoClient:
             'PUT', f'/accounts/{aid}/updatemessage', json_body=body)
         return status == 200
 
-    async def set_star(self, message_ids: list[str], *, starred: bool,
-                       folder_id: str | None = None) -> bool:
+    async def set_star(self, message_ids: list[str], *,
+                       starred: bool) -> bool:
         flag = 'important' if starred else 'flag_not_set'
         aid = (await self.get_account()).account_id
         body = {'mode': 'setFlag', 'flagid': flag,

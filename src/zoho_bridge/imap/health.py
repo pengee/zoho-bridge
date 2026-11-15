@@ -8,7 +8,7 @@ import logging
 import time
 from contextlib import AbstractAsyncContextManager
 
-from .backend import BridgeContext
+from ..context import BridgeContext
 
 __all__ = ['HealthServer']
 
@@ -71,15 +71,7 @@ class HealthServer:
         context = self.context
         store = context.store
         folders = store.list_folders()
-        dead_ops = 0
-        pending_ops = 0
-        with store._lock:  # noqa: SLF001 - cheap counters, same process
-            dead_ops = store._conn.execute(
-                "SELECT COUNT(*) c FROM outbox_ops WHERE status = 'dead'"
-            ).fetchone()['c']
-            pending_ops = store._conn.execute(
-                "SELECT COUNT(*) c FROM outbox_ops WHERE status = 'pending'"
-            ).fetchone()['c']
+        pending_ops, dead_ops = store.op_counts()
         return {
             'sync_ok': context.sync_ok,
             'last_sync_epoch': context.last_sync_epoch,

@@ -35,7 +35,6 @@ class MessageSummary:
     sender: str | None = None
     received_epoch: float | None = None
     size: int | None = None
-    has_attachment: bool | None = None
     read: bool = False
     starred: bool = False
 
@@ -48,7 +47,6 @@ class MessageSummary:
         received = _first(msg, ('receivedTime', 'sentDateInGMT',
                                 'sentDate'))
         size = _first(msg, ('size', 'messageSize', 'mailSize'))
-        has_attach = _first(msg, ('hasAttachment', 'hasAttach', 'attachment'))
         return cls(
             zoho_id=zoho_id,
             subject=str(subject) if subject is not None else None,
@@ -56,7 +54,6 @@ class MessageSummary:
             received_epoch=_to_epoch(received),
             size=int(size) if isinstance(size, (int, float, str)) and
             str(size).isdigit() else None,
-            has_attachment=bool(has_attach) if has_attach is not None else None,
             read=str(_first(msg, ('status', 'isRead', 'read'))) == '1',
             starred=str(_first(msg, ('flagid', 'flagId', 'starred'))) ==
             'important',
@@ -68,18 +65,6 @@ def _first(msg: dict, keys: tuple[str, ...]):
         if key in msg and msg[key] is not None:
             return msg[key]
     return None
-
-
-def _flag(msg: dict, keys: tuple[str, ...]) -> bool:
-    val = _first(msg, keys)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return bool(val)
-    if isinstance(val, str):
-        return val.strip().lower() in ('1', 'true', 'yes', 'read',
-                                       'starred', 'flagged')
-    return False
 
 
 def _to_epoch(val) -> float | None:

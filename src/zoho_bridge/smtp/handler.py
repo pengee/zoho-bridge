@@ -16,13 +16,12 @@ import ssl
 import uuid
 from contextlib import AbstractAsyncContextManager
 from email import message_from_bytes
-from email.message import Message as MimeMessage
-from email.utils import getaddresses
 from typing import Any
 
 from aiosmtpd.smtp import AuthResult, Envelope, LoginPassword, Session, SMTP
 
-from ..imap.backend import BridgeContext
+from ..context import BridgeContext
+from ..mimeutil import addresses, split_mime
 
 __all__ = ['SubmissionServer']
 
@@ -89,9 +88,9 @@ class SubmissionHandler:
         settings = self.context.settings
         client = self.context.client
 
-        to = _addresses(msg, 'To')
-        cc = _addresses(msg, 'Cc')
-        bcc = _addresses(msg, 'Bcc')
+        to = addresses(msg, 'To')
+        cc = addresses(msg, 'Cc')
+        bcc = addresses(msg, 'Bcc')
         subject = msg.get('Subject') or ''
         from_addr = settings.account_address
         if not from_addr:
@@ -105,7 +104,7 @@ class SubmissionHandler:
             msg['Message-ID'] = message_id
             raw = msg.as_bytes()
 
-        text_body, html_body, attachments = _split_mime(msg)
+        text_body, html_body, attachments = split_mime(msg)
         attachment_payloads: list[dict] = []
         if attachments and not settings.allow_attachment_loss:
             # verify the upload endpoint works before sending anything,
@@ -127,44 +126,6 @@ class SubmissionHandler:
             attachments=attachment_payloads or None)
         log.info('sent message %s (%d attachment(s)) via Zoho API',
                  message_id, len(attachment_payloads))
-
-
-def _addresses(msg: MimeMessage, header: str) -> list[str]:
-    return [addr for _, addr in getaddresses(msg.get_all(header, []))
-            if addr]
-
-
-def _split_mime(msg: MimeMessage) \
-        -> tuple[str | None, str | None,
-                 list[tuple[str, bytes, str]]]:
-    text_body: str | None = None
-    html_body: str | None = None
-    attachments: list[tuple[str, bytes, str]] = []
-    for part in msg.walk():
-        if part.is_multipart():
-            continue
-        ctype = part.get_content_type()
-        filename = part.get_filename()
-        disposition = (part.get('Content-Disposition') or '').lower()
-        payload = part.get_payload(decode=True)
-        if payload is None:
-            continue
-        charset = part.get_content_charset() or 'utf-8'
-        if filename or 'attachment' in disposition:
-            attachments.append((filename or 'attachment.bin', payload, ctype))
-        elif ctype == 'text/plain' and text_body is None:
-            text_body = payload.decode(charset, 'replace')
-        elif ctype == 'text/html' and html_body is None:
-            html_body = payload.decode(charset, 'replace')
-        elif ctype.startswith('text/') and text_body is None:
-            text_body = payload.decode(charset, 'replace')
-    if text_body is None and html_body is None and not attachments:
-        # degenerate: use the whole payload as text
-        payload = msg.get_payload(decode=True)
-        if isinstance(payload, bytes):
-            text_body = payload.decode(
-                msg.get_content_charset() or 'utf-8', 'replace')
-    return text_body, html_body, attachments
 
 
 class _AttachmentUnavailable(Exception):

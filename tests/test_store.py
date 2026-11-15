@@ -17,7 +17,7 @@ def test_uid_allocation_monotonic(tmp_path) -> None:
     uids = store.alloc_uids('F1', 3)
     assert uids == [1, 2, 3]
     assert store.alloc_uids('F1') == [4]
-    assert store.get_uid_next('F1') == 5
+    assert store.alloc_uids('F1', 2) == [5, 6]
 
 
 def test_folder_lifecycle(tmp_path) -> None:
@@ -34,8 +34,9 @@ def test_folder_lifecycle(tmp_path) -> None:
     assert row2.uid_validity == uid_validity
     assert row2.zoho_id == 'F2'
     assert store.get_folder_by_zoho_id('F2').imap_name == 'INBOX'
-    store.mark_folder_deleted('INBOX')
+    store.delete_folder('F2')
     assert store.get_folder_by_name('INBOX') is None
+    assert store.get_folder_by_zoho_id('F2') is None
 
 
 def test_message_roundtrip_and_flags(tmp_path) -> None:
@@ -56,7 +57,7 @@ def test_message_roundtrip_and_flags(tmp_path) -> None:
     assert store.get_message('F1', uid).flags == set()
     # zoho id link
     store.set_zoho_id('F1', uid, 'M9')
-    assert store.find_by_zoho_id('M9').uid == uid
+    assert store.get_message('F1', uid).zoho_id == 'M9'
     # delete
     store.delete_messages('F1', [uid])
     assert store.get_message('F1', uid) is None
@@ -112,7 +113,6 @@ def test_message_summary_normalization() -> None:
     assert summary.received_epoch == 1700000000.0
     assert summary.read is True
     assert summary.starred is True
-    assert summary.has_attachment is True
     unread = MessageSummary.from_view({'messageId': '1', 'status': '0',
                                        'flagid': 'flag_not_set'})
     assert unread.read is False and unread.starred is False
