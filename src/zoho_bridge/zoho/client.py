@@ -47,9 +47,11 @@ class ZohoClient:
     are numeric strings in list responses and longs in mutations.
     """
 
-    def __init__(self, settings: BridgeSettings) -> None:
+    def __init__(self, settings: BridgeSettings, *,
+                 transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.settings = settings
-        self._http = httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(60.0),
+                                       transport=transport)
         self._token: str | None = None
         self._token_expiry: float = 0.0
         self._token_lock = asyncio.Lock()
@@ -95,11 +97,14 @@ class ZohoClient:
                       json_body: dict | None = None,
                       params: dict | None = None,
                       content: bytes | None = None,
+                      files: Any = None,
                       headers: dict | None = None,
                       attempts: int = 4) -> tuple[int, Any]:
         """Authorized JSON request with retry/backoff on transient errors.
 
         ``path`` is relative to the API base, e.g. ``/accounts``.
+        ``files`` is passed through to httpx (multipart uploads; mutually
+        exclusive with ``content``).
         Returns ``(status, parsed json or None)``.
         """
         url = self.settings.api_base + path
@@ -110,14 +115,25 @@ class ZohoClient:
             req_headers.update(headers)
         delay = 1.0
         last_error: ZohoApiError | None = None
+        token_refreshed = False
         for attempt in range(attempts):
             try:
                 resp = await self._http.request(
                     method, url, json=json_body, params=params,
-                    content=content, headers=req_headers)
+                    content=content, files=files, headers=req_headers)
             except httpx.TransportError as exc:
                 last_error = ZohoApiError(method, url, None, repr(exc))
             else:
+                if (resp.status_code in (401, 403)
+                        and not token_refreshed):
+                    # access token revoked/invalid early — force one
+                    # refresh and retry with the fresh token
+                    token_refreshed = True
+                    self._token = None
+                    token = await self.access_token()
+                    req_headers['Authorization'] = \
+                        f'Zoho-oauthtoken {token}'
+                    continue
                 if resp.status_code not in RETRY_STATUSES:
                     try:
                         return resp.status_code, resp.json()
@@ -225,18 +241,13 @@ class ZohoClient:
         """Upload one attachment, returning Zoho's attachment id (or None if
         the endpoint variant does not work)."""
         aid = (await self.get_account()).account_id
-        boundary = 'zohobridge-7fa39f'
-        body = (
-            f'--{boundary}\r\n'
-            f'Content-Disposition: form-data; name="file"; '
-            f'filename="{filename}"\r\n'
-            f'Content-Type: {content_type}\r\n\r\n'
-        ).encode() + content + f'\r\n--{boundary}--\r\n'.encode()
+        # strip header-injection characters from the filename; httpx builds
+        # the multipart body (random boundary, quoted filename)
+        safe_name = filename.translate({ord('"'): None, ord('\r'): None,
+                                        ord('\n'): None}) or 'attachment.bin'
         status, data = await self.request(
             'POST', f'/accounts/{aid}/messages/attachments',
-            content=body,
-            headers={'Content-Type':
-                     f'multipart/form-data; boundary={boundary}'})
+            files={'file': (safe_name, content, content_type)})
         if status != 200:
             log.warning('attachment upload failed (HTTP %s): %s',
                         status, str(data)[:200])

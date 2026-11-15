@@ -824,30 +824,39 @@ class ZohoBackend(BackendInterface):
         key_file = getattr(args, 'key', None) or os.environ.get('KEY_FILE')
         if cert_file and key_file:
             return cert_file, key_file
+        if getattr(args, 'require_tls_cert', False):
+            raise ValueError(
+                '--require-tls-cert is set but no TLS certificate is '
+                'configured — provide CERT_FILE/KEY_FILE (or --cert/--key)')
         if not settings.generate_self_signed:
             return None, None
         cert_dir = os.path.dirname(os.path.abspath(settings.db_path)) or '.'
         cert_path = os.path.join(cert_dir, 'bridge-cert.pem')
         key_path = os.path.join(cert_dir, 'bridge-key.pem')
         if not (os.path.exists(cert_path) and os.path.exists(key_path)):
-            cls._generate_self_signed(cert_path, key_path,
-                                      settings.imap_user)
+            cls._generate_self_signed(cert_path, key_path, settings)
             log.info('generated self-signed TLS certificate at %s', cert_path)
         return cert_path, key_path
 
     @classmethod
     def _generate_self_signed(cls, cert_path: str, key_path: str,
-                              common_name: str) -> None:
+                              settings: BridgeSettings) -> None:
+        import socket
+
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
         from datetime import timedelta
 
+        hostnames = [n.strip() for n in
+                     settings.tls_hostnames.split(',') if n.strip()]
+        if not hostnames:
+            hostnames = [socket.gethostname(), 'localhost']
         key = rsa.generate_private_key(public_exponent=65537,
                                        key_size=2048)
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,
-                                                common_name)])
+                                                settings.imap_user)])
         now = datetime.now()
         cert = (
             x509.CertificateBuilder()
@@ -856,12 +865,20 @@ class ZohoBackend(BackendInterface):
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - timedelta(minutes=5))
-            .not_valid_after(now + timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None),
+            .not_valid_after(now + timedelta(days=825))
+            # leaf certificate: CA must be False; verification relies on the
+            # SAN (CN is ignored by modern TLS stacks)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None),
                            critical=True)
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.DNSName(n) for n in hostnames]),
+                critical=False)
             .sign(key, hashes.SHA256())
         )
-        with open(key_path, 'wb') as fh:
+        # create the key with owner-only permissions from the start
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'wb') as fh:
             fh.write(key.private_bytes(
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.TraditionalOpenSSL,

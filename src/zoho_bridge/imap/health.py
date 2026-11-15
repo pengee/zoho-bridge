@@ -22,9 +22,14 @@ class HealthServer:
         self.context = context
 
     async def start(self, stack: AbstractAsyncContextManager) -> None:
+        settings = self.context.settings
         server = await asyncio.start_server(
-            self._handle, host='0.0.0.0', port=self.context.settings
-            .health_port)
+            self._handle, host=settings.health_host,
+            port=settings.health_port)
+        if settings.health_host not in ('127.0.0.1', 'localhost', '::1'):
+            log.warning('health/status endpoint exposed on %s — it is '
+                        'unauthenticated; consider BRIDGE_HEALTH_HOST='
+                        '127.0.0.1', settings.health_host)
         await stack.enter_async_context(server)  # type: ignore[arg-type]
         task = asyncio.create_task(server.serve_forever(), name='health')
         stack.callback(task.cancel)

@@ -77,7 +77,10 @@ class SubmissionHandler:
             return '451 4.7.0 Attachment upload to Zoho unavailable; try again later'
         except Exception as exc:  # noqa: BLE001 - report as temporary failure
             log.exception('submission failed')
-            return f'451 4.3.0 Zoho send failed: {exc}'
+            # collapse newlines: exception text can embed upstream HTTP
+            # bodies, which would smuggle forged SMTP responses
+            detail = ' '.join(str(exc).split())[:200]
+            return f'451 4.3.0 Zoho send failed: {detail}'
         self.context.wake_sync()
         return '250 Message accepted for delivery'
 
