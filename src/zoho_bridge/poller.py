@@ -277,8 +277,8 @@ class OpsWorker:
 
     def _fail(self, op: Any, exc: Exception) -> None:
         attempts = op.attempts + 1
-        alive = self.context.store.op_fail(op.op_id, str(exc))
         delay = min(60 * attempts, 3600)
+        alive = self.context.store.op_fail(op.op_id, str(exc), delay)
         if not alive:
             log.error('op %s %s abandoned after %d attempts: %s',
                       op.op_id, op.kind, attempts, exc)
@@ -321,16 +321,31 @@ class OpsWorker:
         row = store.get_message(op.zoho_folder_id, op.uid)
         if row is None or row.pending_op is None:
             return  # deleted locally meanwhile, or already handled
+
+        def clear_marker() -> None:
+            # every terminal path must clear pending_op: an op is dropped
+            # once apply() returns, so a stale marker would strand the row
+            # "in flight" forever with nothing left to retry it
+            store.set_pending_op(op.zoho_folder_id, op.uid, None)
+
         raw = store.load_raw(op.zoho_folder_id, op.uid)
         if raw is None:
+            log.warning('draft uid %d: raw body missing, upload dropped',
+                        op.uid)
+            clear_marker()
             return
         payload = _draft_payload(raw)
         if payload is None:
+            log.warning('draft uid %d: unparseable MIME, upload dropped',
+                        op.uid)
+            clear_marker()
             return
+        # an API error here raises: the op is retried later, and the
+        # marker must stay set for the retry to proceed
         zoho_id = await context.client.save_draft(payload)
         if zoho_id:
             store.set_zoho_id(op.zoho_folder_id, op.uid, zoho_id)
-        store.set_pending_op(op.zoho_folder_id, op.uid, None)
+        clear_marker()
 
     async def _file_sent(self, op: Any) -> None:
         """Best-effort filing of a locally-appended sent message.
@@ -341,21 +356,36 @@ class OpsWorker:
         context = self.context
         store = context.store
         row = store.get_message(op.zoho_folder_id, op.uid)
-        if row is None or row.zoho_id is not None:
+        if row is None:
+            return  # deleted locally meanwhile
+
+        def clear_marker() -> None:
+            store.set_pending_op(op.zoho_folder_id, op.uid, None)
+
+        if row.zoho_id is not None:
+            # linked by the poller while this op was queued
+            clear_marker()
             return
         raw = store.load_raw(op.zoho_folder_id, op.uid)
         if raw is None:
+            log.warning('sent-copy uid %d: raw body missing, filing dropped',
+                        op.uid)
+            clear_marker()
             return
         msg_id = _extract_message_id(raw)
         if msg_id:
             for candidate in store.find_by_message_id(msg_id):
                 if candidate.zoho_folder_id == op.zoho_folder_id and \
                         candidate.zoho_id:
+                    clear_marker()
                     return  # Zoho copy already linked by the poller
         payload = _draft_payload(raw)
         if payload is None:
-            store.set_pending_op(op.zoho_folder_id, op.uid, None)
+            log.warning('sent-copy uid %d: unparseable MIME, filing dropped',
+                        op.uid)
+            clear_marker()
             return
+        # an API error here raises; the op retries later with the marker set
         draft_id = await context.client.save_draft(payload)
         if draft_id:
             sent = store.get_folder_by_name('Sent')
@@ -363,7 +393,7 @@ class OpsWorker:
                 await context.client.move_messages(
                     [draft_id], to_folder_id=sent.zoho_id)
                 store.set_zoho_id(op.zoho_folder_id, op.uid, draft_id)
-        store.set_pending_op(op.zoho_folder_id, op.uid, None)
+        clear_marker()
 
 
 def _draft_payload(raw: bytes) -> dict | None:
