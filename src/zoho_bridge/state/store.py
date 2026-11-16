@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS outbox_ops (
     attempts INTEGER NOT NULL DEFAULT 0,
     created REAL NOT NULL,
     next_try REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    failed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_ops_due ON outbox_ops(status, next_try);
 """
@@ -137,6 +139,7 @@ class Store:
             self._conn.execute('PRAGMA journal_mode=WAL')
             self._conn.execute('PRAGMA synchronous=NORMAL')
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
             # one-shot boot scan; kept exact via deltas afterwards so the
             # hot paths (cache size check, prune) never rescan the BLOBs
@@ -144,6 +147,19 @@ class Store:
                 'SELECT COALESCE(SUM(LENGTH(raw)), 0) FROM messages '
                 'WHERE raw IS NOT NULL').fetchone()
             self._raw_bytes = int(row[0])
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release (SQLite has no
+        ADD COLUMN IF NOT EXISTS; CREATE TABLE IF NOT EXISTS never alters
+        an existing table). Must run with the lock held."""
+        cols = {r['name'] for r in self._conn.execute(
+            'PRAGMA table_info(outbox_ops)')}
+        if 'last_error' not in cols:
+            self._conn.execute(
+                'ALTER TABLE outbox_ops ADD COLUMN last_error TEXT')
+        if 'failed_at' not in cols:
+            self._conn.execute(
+                'ALTER TABLE outbox_ops ADD COLUMN failed_at REAL')
 
     def close(self) -> None:
         with self._lock:
@@ -455,7 +471,13 @@ class Store:
                                (op_id,))
 
     def op_fail(self, op_id: int, error: str, delay: float = 60.0) -> bool:
-        """Record a failure; returns False when the op is dead (gave up)."""
+        """Record a failure; returns False when the op is dead (gave up).
+
+        The reason is persisted on the row (flattened to one line) so
+        ``/status`` can surface *why* ops died long after the matching log
+        lines have scrolled away.
+        """
+        err = ' '.join(str(error).split())[:500] or None
         with self._lock, self._conn:
             row = self._conn.execute(
                 'SELECT attempts FROM outbox_ops WHERE op_id = ?',
@@ -465,14 +487,26 @@ class Store:
             attempts = int(row['attempts']) + 1
             if attempts >= MAX_OP_ATTEMPTS:
                 self._conn.execute(
-                    "UPDATE outbox_ops SET status = 'dead' WHERE op_id = ?",
-                    (op_id,))
+                    "UPDATE outbox_ops SET status = 'dead', attempts = ?, "
+                    'last_error = ?, failed_at = ? WHERE op_id = ?',
+                    (attempts, err, time.time(), op_id))
                 return False
             self._conn.execute(
-                'UPDATE outbox_ops SET attempts = ?, next_try = ? '
-                'WHERE op_id = ?',
-                (attempts, time.time() + delay, op_id))
+                'UPDATE outbox_ops SET attempts = ?, next_try = ?, '
+                'last_error = ?, failed_at = ? WHERE op_id = ?',
+                (attempts, time.time() + delay, err, time.time(), op_id))
         return True
+
+    def recent_dead_ops(self, limit: int = 10) -> list[dict]:
+        """The most recently failed dead ops, for ``/status``."""
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT op_id, kind, zoho_folder_id, uid, attempts, '
+                "last_error, failed_at FROM outbox_ops "
+                "WHERE status = 'dead' "
+                'ORDER BY COALESCE(failed_at, created) DESC LIMIT ?',
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     def op_counts(self) -> tuple[int, int]:
         """Return ``(pending, dead)`` outbox op counts."""

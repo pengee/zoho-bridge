@@ -14,6 +14,7 @@ import pytest
 
 from zoho_bridge.config import BridgeSettings
 from zoho_bridge.context import BridgeContext
+from zoho_bridge.imap.health import HealthServer
 from zoho_bridge.poller import OpsWorker
 from zoho_bridge.state.store import MessageRow, Store
 from zoho_bridge.zoho.client import ZohoApiError
@@ -232,6 +233,29 @@ async def test_flag_and_expunge_ops_are_coalesced() -> None:
     assert client.star_batches == [(['M4'], True)]
     assert client.expunge_batches == [(['M5', 'M6'], '77'), (['M7'], '88')]
     assert store.pop_due_ops() == []
+
+
+def test_status_surfaces_dead_op_reasons() -> None:
+    """The give-up reason survives to /status: an operator must be able
+    to see *why* an op is dead without grepping rotated logs."""
+    store = _make_store()
+    worker = _worker(store)
+    op_id = store.enqueue_op('flag_read', payload={'zoho_id': 'M1',
+                                                   'read': True})
+    with store._lock:
+        store._conn.execute(
+            'UPDATE outbox_ops SET attempts = 9 WHERE op_id = ?', (op_id,))
+        store._conn.commit()
+    op = store.pop_due_ops()[0]
+    worker._fail(op, ZohoApiError('PUT', '/updatemessage', 200,
+                                  "body failure: {'errorCode': "
+                                  "'MESSAGE_NOT_FOUND'}"))
+    context = BridgeContext(BridgeSettings(), StubClient(), store)
+    status = HealthServer(context)._status()
+    assert status['dead_ops'] == 1
+    recent = status['dead_ops_recent']
+    assert [d['kind'] for d in recent] == ['flag_read']
+    assert 'MESSAGE_NOT_FOUND' in recent[0]['last_error']
 
 
 async def test_coalesced_group_failure_fails_each_op() -> None:

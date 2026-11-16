@@ -105,7 +105,10 @@ as the password pattern — every user's account appears automatically.
 need one bridge instance per Zoho account.)
 
 Health/status: `http://bridge-host:8000/healthz` and `/status` (JSON:
-last sync, folders, pending/dead ops, raw-cache size).
+last sync, folders, pending/dead ops, raw-cache size — plus
+`dead_ops_recent` with the last error of each abandoned op; ops that gave
+up after 10 attempts are kept for inspection, clear them with
+`DELETE FROM outbox_ops WHERE status='dead'` via `sqlite3 /data/bridge.db`).
 
 ## Configuration reference
 

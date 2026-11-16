@@ -2,7 +2,12 @@
 
 import sqlite3
 
-from zoho_bridge.state.store import MessageRow, Store, normalize_message_id
+from zoho_bridge.state.store import (
+    MAX_OP_ATTEMPTS,
+    MessageRow,
+    Store,
+    normalize_message_id,
+)
 from zoho_bridge.zoho.models import MessageSummary
 
 # schema exactly as shipped before the `deleted` column was dropped —
@@ -77,6 +82,11 @@ def test_legacy_schema_database_still_opens(tmp_path) -> None:
         # inserts no longer name the legacy column — default covers it
         store.upsert_folder(zoho_id='F2', imap_name='Sent')
         assert store.get_folder_by_name('Sent').zoho_id == 'F2'
+        # last_error/failed_at came from the boot migration — op_fail
+        # writes them, so the pending UPDATE proves the ALTER happened
+        op_id = store.enqueue_op('flag_read', payload={'zoho_id': 'M1'})
+        assert store.op_fail(op_id, 'boom', delay=0)
+        assert store.recent_dead_ops() == []
     finally:
         store.close()
 
@@ -211,6 +221,48 @@ def test_ops_lifecycle(tmp_path) -> None:
             break
     ops = store.pop_due_ops()
     assert ops == []  # dead ops are never popped again
+
+
+def test_op_fail_records_error_and_dead_ops_are_listable(tmp_path) -> None:
+    store = Store(str(tmp_path / 't.db'))
+    try:
+        # a retried failure keeps the flattened reason while still pending
+        op_id = store.enqueue_op('flag_read', payload={'zoho_id': 'M1',
+                                                       'read': True})
+        assert store.op_fail(op_id, 'PUT x -> HTTP 200:\r\n RATE\r\nLIMIT',
+                             delay=0)
+        with store._lock:
+            row = store._conn.execute(
+                'SELECT last_error, failed_at FROM outbox_ops '
+                'WHERE op_id = ?', (op_id,)).fetchone()
+        assert row['last_error'] == 'PUT x -> HTTP 200: RATE LIMIT'
+        assert row['failed_at']
+        assert store.recent_dead_ops() == []
+
+        # driving it to dead records kind + final reason for /status
+        alive = True
+        while alive:
+            alive = store.op_fail(op_id, 'MESSAGE_NOT_FOUND', delay=0)
+        assert store.pop_due_ops() == []
+        dead = store.recent_dead_ops()
+        assert [d['op_id'] for d in dead] == [op_id]
+        assert dead[0]['kind'] == 'flag_read'
+        assert dead[0]['last_error'] == 'MESSAGE_NOT_FOUND'
+        assert dead[0]['attempts'] == MAX_OP_ATTEMPTS
+
+        # newest failure first, limit honored
+        op2 = store.enqueue_op('expunge', payload={'zoho_ids': ['M2']})
+        alive = True
+        while alive:
+            alive = store.op_fail(op2, 'gone', delay=0)
+        with store._lock, store._conn:
+            store._conn.execute(
+                'UPDATE outbox_ops SET failed_at = failed_at - 100 '
+                'WHERE op_id = ?', (op_id,))
+        assert [d['op_id'] for d in store.recent_dead_ops()] == [op2, op_id]
+        assert len(store.recent_dead_ops(limit=1)) == 1
+    finally:
+        store.close()
 
 
 def test_message_summary_normalization() -> None:

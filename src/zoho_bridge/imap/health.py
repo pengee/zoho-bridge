@@ -81,6 +81,9 @@ class HealthServer:
             'folders': {f.imap_name: f.zoho_id for f in folders},
             'pending_ops': pending_ops,
             'dead_ops': dead_ops,
+            # why the give-ups gave up (newest first); counts stay above
+            # for cheap probing
+            'dead_ops_recent': store.recent_dead_ops(),
             'raw_cache_bytes': store.raw_cache_size(),
         }
 
