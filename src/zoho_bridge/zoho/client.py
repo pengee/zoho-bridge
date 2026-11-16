@@ -38,6 +38,33 @@ class ZohoApiError(Exception):
         self.status = status
 
 
+def _is_success(status: int, data: Any) -> bool:
+    """True only when the API really accepted the call.
+
+    Zoho reports many failures *inside* an HTTP 200 body — a ``status.code``
+    that is not 200 and/or an ``errorCode`` next to it — so the transport
+    status alone is not enough, particularly for mutations where a silent
+    failure would mark the outbox op done.
+    """
+    if not 200 <= status < 300:
+        return False
+    if isinstance(data, bool):
+        return data
+    if not isinstance(data, dict):
+        return True
+    for node in (data, data.get('data')):
+        if isinstance(node, dict) and (node.get('errorCode')
+                                       or node.get('error_code')):
+            return False
+    state = data.get('status')
+    if isinstance(state, dict) and 'code' in state:
+        try:
+            return int(state['code']) == 200
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 class ZohoClient:
     """One client instance per running bridge (single Zoho account).
 
@@ -149,6 +176,14 @@ class ZohoClient:
                 delay *= 2
         raise last_error or ZohoApiError(method, url, None, 'exhausted')
 
+    def _ok(self, method: str, path: str, status: int,
+            data: Any) -> None:
+        """Raise unless the response reports real success (see
+        :func:`_is_success`)."""
+        if not _is_success(status, data):
+            raise ZohoApiError(method, self.settings.api_base + path,
+                               status, str(data)[:300])
+
     # -- read endpoints ----------------------------------------------------
 
     async def get_account(self) -> Account:
@@ -156,7 +191,7 @@ class ZohoClient:
             return self._account
         status, data = await self.request('GET', '/accounts')
         accounts = data.get('data') if isinstance(data, dict) else None
-        if status != 200 or not accounts:
+        if not _is_success(status, data) or not accounts:
             raise ZohoApiError('GET', '/accounts', status, str(data)[:300])
         if isinstance(accounts, list):
             acct = accounts[0]
@@ -173,7 +208,7 @@ class ZohoClient:
     async def list_folders(self) -> list[Folder]:
         aid = (await self.get_account()).account_id
         status, data = await self.request('GET', f'/accounts/{aid}/folders')
-        if status != 200:
+        if not _is_success(status, data):
             raise ZohoApiError('GET', '/accounts/{id}/folders', status,
                                str(data)[:300])
         return [Folder(zoho_id=str(f.get('folderId')),
@@ -186,7 +221,9 @@ class ZohoClient:
         status, data = await self.request(
             'GET', f'/accounts/{aid}/messages/view',
             params={'folderId': folder_id, 'limit': limit, 'start': start})
-        if status != 200:
+        # a body-level failure here must raise: an empty-looking view that
+        # is actually an error would read as "folder emptied" on a sweep
+        if not _is_success(status, data):
             raise ZohoApiError('GET', '/messages/view', status,
                                str(data)[:200])
         return [MessageSummary.from_view(m) for m in _entries(data)
@@ -196,7 +233,7 @@ class ZohoClient:
         aid = (await self.get_account()).account_id
         status, data = await self.request(
             'GET', f'/accounts/{aid}/messages/{message_id}/originalmessage')
-        if status != 200 or not isinstance(data, dict):
+        if not _is_success(status, data) or not isinstance(data, dict):
             raise ZohoApiError('GET', '/originalmessage', status,
                                str(data)[:200])
         content = data.get('content')
@@ -231,9 +268,7 @@ class ZohoClient:
             payload['attachments'] = attachments
         status, data = await self.request(
             'POST', f'/accounts/{aid}/messages', json_body=payload)
-        if status != 200:
-            raise ZohoApiError('POST', '/messages (send)', status,
-                               str(data)[:300])
+        self._ok('POST', f'/accounts/{aid}/messages (send)', status, data)
         return _find_id(data)
 
     async def upload_attachment(self, filename: str, content: bytes,
@@ -248,7 +283,8 @@ class ZohoClient:
         status, data = await self.request(
             'POST', f'/accounts/{aid}/messages/attachments',
             files={'file': (safe_name, content, content_type)})
-        if status != 200:
+        if not _is_success(status, data):
+            # caller decides (attachment-loss policy); no raise by design
             log.warning('attachment upload failed (HTTP %s): %s',
                         status, str(data)[:200])
             return None
@@ -261,20 +297,23 @@ class ZohoClient:
         body = {'mode': 'saveDraft', **payload}
         status, data = await self.request(
             'POST', f'/accounts/{aid}/messages', json_body=body)
-        if status != 200:
-            raise ZohoApiError('POST', '/messages (saveDraft)', status,
-                               str(data)[:300])
+        self._ok('POST', f'/accounts/{aid}/messages (saveDraft)',
+                 status, data)
         return _find_id(data)
 
     async def mark_read(self, message_ids: list[str], *,
                         read: bool) -> bool:
+        """Raises :class:`ZohoApiError` on failure (incl. body-level
+        ``status.code``/``errorCode`` in an HTTP 200) so the ops worker
+        retries instead of marking the op done."""
         mode = 'markAsRead' if read else 'markAsUnread'
         aid = (await self.get_account()).account_id
         body = {'mode': mode,
                 'messageId': [int(x) for x in message_ids]}
-        status, _ = await self.request(
+        status, data = await self.request(
             'PUT', f'/accounts/{aid}/updatemessage', json_body=body)
-        return status == 200
+        self._ok('PUT', f'/accounts/{aid}/updatemessage', status, data)
+        return True
 
     async def set_star(self, message_ids: list[str], *,
                        starred: bool) -> bool:
@@ -282,9 +321,10 @@ class ZohoClient:
         aid = (await self.get_account()).account_id
         body = {'mode': 'setFlag', 'flagid': flag,
                 'messageId': [int(x) for x in message_ids]}
-        status, _ = await self.request(
+        status, data = await self.request(
             'PUT', f'/accounts/{aid}/updatemessage', json_body=body)
-        return status == 200
+        self._ok('PUT', f'/accounts/{aid}/updatemessage', status, data)
+        return True
 
     async def move_messages(self, message_ids: list[str], *,
                             to_folder_id: str,
@@ -298,32 +338,37 @@ class ZohoClient:
         if from_folder_id:
             body['folderId'] = int(from_folder_id)
             body['isFolderSpecific'] = True
-        status, _ = await self.request(
+        status, data = await self.request(
             'PUT', f'/accounts/{aid}/updatemessage', json_body=body)
-        return status == 200
+        self._ok('PUT', f'/accounts/{aid}/updatemessage', status, data)
+        return True
 
     async def delete_messages(self, message_ids: list[str],
                               folder_id: str) -> bool:
         """Delete messages (moves to Zoho Trash — ``expunge=false`` default).
 
         The documented endpoint is per-message with the source folderId in
-        the path.
+        the path. Raises :class:`ZohoApiError` on failure; a 404 counts as
+        success (the message is already gone from the source folder, which
+        is what the op wants), so a retried group never dead-letters over
+        its own earlier partial success.
         """
         aid = (await self.get_account()).account_id
-        ok = True
         for mid in message_ids:
-            status, _ = await self.request(
-                'DELETE', f'/accounts/{aid}/folders/{int(folder_id)}'
-                          f'/messages/{int(mid)}')
-            ok &= status in (200, 204)
-        return ok
+            path = (f'/accounts/{aid}/folders/{int(folder_id)}'
+                    f'/messages/{int(mid)}')
+            status, data = await self.request('DELETE', path)
+            if status == 404:
+                continue
+            self._ok('DELETE', path, status, data)
+        return True
 
     async def create_folder(self, name: str) -> Folder | None:
         aid = (await self.get_account()).account_id
         path = f'/accounts/{aid}/folders'
         for body in ({'folderName': name}, {'name': name}):
             status, data = await self.request('POST', path, json_body=body)
-            if status == 200:
+            if _is_success(status, data):
                 entries = _entries(data)
                 if entries and entries[0].get('folderId'):
                     f = entries[0]
@@ -335,11 +380,11 @@ class ZohoClient:
     async def delete_folder(self, folder_id: str) -> bool:
         aid = (await self.get_account()).account_id
         try:
-            status, _ = await self.request(
+            status, data = await self.request(
                 'DELETE', f'/accounts/{aid}/folders/{folder_id}')
         except ZohoApiError:
             return False
-        return status in (200, 204)
+        return _is_success(status, data)
 
 
 def _entries(data: Any) -> list[dict]:

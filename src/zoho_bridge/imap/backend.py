@@ -53,7 +53,7 @@ from ..context import BridgeContext
 from ..poller import OpsWorker, Poller
 from ..smtp.handler import SubmissionServer
 from ..state.store import FolderRow, MessageRow, Store, normalize_message_id
-from ..zoho.client import ZohoClient
+from ..zoho.client import ZohoApiError, ZohoClient
 from .health import HealthServer
 
 __all__ = ['ZohoBackend']
@@ -443,13 +443,14 @@ class ZohoMailboxData(MailboxDataInterface[Message]):
         moved_on_zoho = False
         if src.zoho_id and \
                 self._folder.zoho_id != destination.folder.zoho_id:
-            moved_on_zoho = await self._context.client.move_messages(
-                [src.zoho_id], to_folder_id=destination.folder.zoho_id,
-                from_folder_id=self._folder.zoho_id)
-            if not moved_on_zoho:
-                raise NotAllowedError('Zoho move API unavailable — '
-                                      'run the spike and check '
-                                      'docs/zoho-api-notes.md')
+            try:
+                await self._context.client.move_messages(
+                    [src.zoho_id], to_folder_id=destination.folder.zoho_id,
+                    from_folder_id=self._folder.zoho_id)
+                moved_on_zoho = True
+            except ZohoApiError as exc:
+                raise NotAllowedError(
+                    f'Zoho move failed: {exc}') from exc
         raw = await self.load_raw_bytes(src)
         dest_uid = await destination.append_raw(
             raw, src.internal_date, src.permanent_flags, recent=recent,

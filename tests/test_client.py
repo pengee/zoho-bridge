@@ -2,7 +2,9 @@
 
 Covers the early-revocation fix (401/403 forces exactly one token refresh
 and retry), the multipart attachment upload (httpx-built body, sanitized
-filename), and the raw-MIME decoding heuristic.
+filename), the raw-MIME decoding heuristic, and the body-level failure
+semantics (Zoho reports failures inside HTTP 200 bodies; mutations must
+raise so the ops worker retries).
 """
 
 from __future__ import annotations
@@ -13,7 +15,12 @@ import httpx
 import pytest
 
 from zoho_bridge.config import BridgeSettings
-from zoho_bridge.zoho.client import ZohoApiError, ZohoClient, _decode_raw
+from zoho_bridge.zoho.client import (
+    ZohoApiError,
+    ZohoClient,
+    _decode_raw,
+    _is_success,
+)
 
 
 def _settings() -> BridgeSettings:
@@ -94,6 +101,104 @@ async def test_upload_attachment_multipart_and_filename_sanitizing() \
     assert b'name="file"' in body
     # the CRLF from the crafted filename must not survive into headers
     assert b'\r\nX-Trick' not in body
+
+
+# -- body-level success semantics -----------------------------------------
+
+def test_is_success_semantics() -> None:
+    assert _is_success(200, {'status': {'code': 200,
+                                        'description': 'success'}})
+    # endpoints without a status node (e.g. the attachment upload) stay
+    # trusted on HTTP 2xx
+    assert _is_success(200, {'data': {'attachmentId': 'A1'}})
+    assert _is_success(204, None)
+    assert not _is_success(200, {'status': {'code': 404,
+                                            'description': 'Invalid Input'}})
+    assert not _is_success(200, {'data': {'errorCode': 'RATE_LIMIT'}})
+    assert not _is_success(200, {'status': {'code': 'not-a-number'}})
+    assert not _is_success(200, False)
+    assert _is_success(200, True)
+    assert not _is_success(503, None)
+    assert not _is_success(404, {'data': []})
+
+
+async def test_mutation_raises_on_http200_body_failure() -> None:
+    """The exact hazard: Zoho returns 200 with an error body; the ops
+    worker must see an exception (retry/backoff), not op_done."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == '/oauth/v2/token':
+            return httpx.Response(200, json={'access_token': 'T',
+                                             'expires_in': 3600})
+        if request.url.path.endswith('/accounts'):
+            return httpx.Response(200, json=ACCOUNT_JSON)
+        return httpx.Response(200, json={
+            'data': {'errorCode': 'MESSAGE_NOT_FOUND'},
+            'status': {'code': 404, 'description': 'Invalid Input'}})
+
+    client = _client(handler)
+    with pytest.raises(ZohoApiError) as excinfo:
+        await client.mark_read(['123'], read=True)
+    assert 'MESSAGE_NOT_FOUND' in str(excinfo.value)
+    with pytest.raises(ZohoApiError):
+        await client.set_star(['123'], starred=True)
+    with pytest.raises(ZohoApiError):
+        await client.send(from_addr='me@example.com', to=['x@y.z'],
+                          subject='s', text_body='b')
+
+
+async def test_delete_messages_404_is_idempotent_success() -> None:
+    """A retried expunge group must not dead-letter over ids it already
+    trashed in a previous partial run (they answer 404 now)."""
+    path_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == '/oauth/v2/token':
+            return httpx.Response(200, json={'access_token': 'T',
+                                             'expires_in': 3600})
+        if request.url.path.endswith('/accounts'):
+            return httpx.Response(200, json=ACCOUNT_JSON)
+        path_ids.append(request.url.path.rsplit('/', 1)[-1])
+        if request.url.path.endswith('/111'):
+            return httpx.Response(404, json={
+                'status': {'code': 404, 'description': 'not found'}})
+        return httpx.Response(200, json={'status': {'code': 200}})
+
+    assert await _client(handler).delete_messages(
+        ['111', '222'], '77') is True
+    assert path_ids == ['111', '222']
+
+
+async def test_delete_messages_raises_on_hard_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == '/oauth/v2/token':
+            return httpx.Response(200, json={'access_token': 'T',
+                                             'expires_in': 3600})
+        if request.url.path.endswith('/accounts'):
+            return httpx.Response(200, json=ACCOUNT_JSON)
+        return httpx.Response(422, json={'status': {'code': 422}})
+
+    with pytest.raises(ZohoApiError) as excinfo:
+        await _client(handler).delete_messages(['5'], '77')
+    assert excinfo.value.status == 422
+
+
+async def test_list_failure_raises_instead_of_empty_view() -> None:
+    """A 200+errorCode view must never be mistaken for an emptied folder
+    (that would mass-delete messages on a full sweep)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == '/oauth/v2/token':
+            return httpx.Response(200, json={'access_token': 'T',
+                                             'expires_in': 3600})
+        if request.url.path.endswith('/accounts'):
+            return httpx.Response(200, json=ACCOUNT_JSON)
+        return httpx.Response(200, json={
+            'data': {'errorCode': 'INTERNAL'},
+            'status': {'code': 8510087, 'description': 'error'}})
+
+    with pytest.raises(ZohoApiError):
+        await _client(handler).list_messages('77')
 
 
 def test_decode_raw_base64_and_text() -> None:
