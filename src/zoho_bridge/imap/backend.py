@@ -818,7 +818,38 @@ class ZohoBackend(BackendInterface):
         if not (os.path.exists(cert_path) and os.path.exists(key_path)):
             cls._generate_self_signed(cert_path, key_path, settings)
             log.info('generated self-signed TLS certificate at %s', cert_path)
+        else:
+            cls._warn_on_san_drift(cert_path, settings)
         return cert_path, key_path
+
+    @classmethod
+    def _warn_on_san_drift(cls, cert_path: str,
+                           settings: BridgeSettings) -> None:
+        """Warn (never fail) when BRIDGE_TLS_HOSTNAME lists hostnames the
+        on-disk cert does not carry — clients that verify the distributed
+        cert will reject the connection until it is re-generated."""
+        wanted = [n.strip() for n in settings.tls_hostnames.split(',')
+                  if n.strip()]
+        if not wanted:
+            return
+        try:
+            from cryptography import x509
+            with open(cert_path, 'rb') as fh:
+                cert = x509.load_pem_x509_certificate(fh.read())
+            ext = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName)
+            have = {n.lower() for n in
+                    ext.value.get_values_for_type(x509.DNSName)}
+        except Exception:  # noqa: BLE001 - diagnostics must not break boot
+            return
+        missing = [n for n in wanted if n.lower() not in have]
+        if missing:
+            log.warning(
+                'existing cert %s lacks SAN entries: %s — '
+                'BRIDGE_TLS_HOSTNAME changed since it was generated; '
+                'TLS-verifying clients will reject it until the cert files '
+                'are deleted (bridge-cert.pem/bridge-key.pem) and '
+                'regenerated', cert_path, ', '.join(missing))
 
     @classmethod
     def _generate_self_signed(cls, cert_path: str, key_path: str,

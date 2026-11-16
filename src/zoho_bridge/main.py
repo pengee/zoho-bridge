@@ -1,9 +1,13 @@
-"""Entry point: delegates to pymap's CLI, which loads the ``zoho`` backend
-via the ``pymap.backend`` entry point registered by this package.
+"""Entry point: installs the proxyprotocol task-retention patch (see
+:func:`_patch_proxy_protocol_task_retention`), then delegates to pymap's
+CLI, which loads the ``zoho`` backend via the ``pymap.backend`` entry point
+registered by this package.
 
-Typical invocation::
+Always launch through this module — never the bare ``pymap`` console
+script, which skips the patch and lets the GC silently kill live IMAP
+connections::
 
-    pymap --debug --host 0.0.0.0 --port 1143 zoho
+    python -m zoho_bridge --debug --host 0.0.0.0 --port 1143 zoho
 
 Environment (see ``docs/zoho-oauth-setup.md`` and ``config.py``) carries the
 Zoho credentials and bridge settings.

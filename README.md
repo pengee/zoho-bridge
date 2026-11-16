@@ -74,6 +74,21 @@ podman run -d --name zoho-bridge \
 or with the provided quadlet unit (`zoho-bridge.container`) → systemd.
 A self-signed TLS cert is generated on first start (`/data/bridge-*.pem`).
 
+**Upgrading from a pre-non-root image:** the container now runs as uid
+10001, but podman only copies the image's directory ownership into a named
+volume when the volume is *created* — an existing `zoho-bridge-data` volume
+stays root-owned and the upgraded container can no longer open the SQLite
+DB (it exits with a permissions error). One-time fix with the container
+stopped:
+
+```bash
+podman run --rm -v zoho-bridge-data:/data --user root \
+  docker.io/library/python:3.12-slim chown -R 10001:10001 /data
+```
+
+(Deleting the named volume also works but discards the UID map and cached
+bodies — UIDs restart, clients re-sync everything.)
+
 ### 3. Connect Nextcloud Mail
 
 - IMAP: `bridge-host.lan:1143`, **STARTTLS**, user/password from above
@@ -185,6 +200,10 @@ docs/                  OAuth setup + verified-API notes
 - **Self-signed cert** (new installs) carries a `subjectAltName` of
   `BRIDGE_TLS_HOSTNAME` (default: the host name) and `CA=FALSE`, so you *can*
   distribute the cert and keep TLS verification on instead of disabling it.
+  Existing certs are never touched automatically: change
+  `BRIDGE_TLS_HOSTNAME` later and the bridge warns at startup — delete
+  `bridge-cert.pem`/`bridge-key.pem` to regenerate with the new names
+  (clients must re-import the cert).
 - **Sync cadence.** Each poll cycle normally pages a folder only until the
   first page of already-known messages (fast for idle folders). A full sweep
   every `BRIDGE_FULL_SCAN_EVERY` cycles re-reads everything to catch older
