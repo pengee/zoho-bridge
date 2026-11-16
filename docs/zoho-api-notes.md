@@ -40,6 +40,21 @@ ZohoMail.accounts.READ,ZohoMail.folders.READ,ZohoMail.folders.CREATE,ZohoMail.me
 | Delete folder | `DELETE /api/accounts/{aid}/folders/{fid}` | |
 | Attachment upload | `POST /api/accounts/{aid}/messages/attachments` | **BLOCKED on free plan: 404 `UPLOAD_RULE_NOT_CONFIGURED`** — bridge rejects submissions with attachments unless `BRIDGE_ALLOW_ATTACHMENT_LOSS=1`; attachment *reading* works via raw MIME |
 
+## Response semantics (what the client must check)
+
+- A call can report failure **inside an HTTP 200** body: `status.code`
+  other than 200 and/or a `data.errorCode` next to it (also observed on
+  hard 404s, e.g. `URL_RULE_NOT_CONFIGURED` above). The client accepts a
+  call only when the HTTP status is 2xx *and* neither appears —
+  otherwise outbox ops would be marked done on rejected mutations.
+- 401/403 can arrive **before the token's advertised expiry**: force one
+  token refresh and retry the request once.
+- Transient statuses **429/5xx** are retried with backoff, honoring
+  `Retry-After` when present.
+- Assumption (not spike-verified): deleting a message already gone from
+  the source folder answers 404 — treated as success so a retried bulk
+  trash doesn't dead-letter over its own earlier partial success.
+
 ## View field semantics (verified by diffing around mutations)
 
 - `status`: `"1"` = read, `"0"` = unread (`status2` is unrelated — stays `"0"`)
